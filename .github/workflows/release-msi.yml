@@ -30,42 +30,8 @@ jobs:
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
-      - name: Validate version bump against latest stable release
-        uses: actions/github-script@v7
-        env:
-          APP_VERSION: ${{ steps.app_version.outputs.version }}
-        with:
-          script: |
-            const owner = context.repo.owner;
-            const repo = context.repo.repo;
-            const appVersion = process.env.APP_VERSION;
-            const releases = await github.paginate(github.rest.repos.listReleases, {
-              owner,
-              repo,
-              per_page: 100,
-            });
-
-            const stable = releases
-              .filter(r => !r.draft && !r.prerelease)
-              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-
-            if (stable.length === 0) {
-              core.info("Nenhum release estavel anterior encontrado. Prosseguindo.");
-              return;
-            }
-
-            const latestTag = stable[0].tag_name || "";
-            const latestVersion = latestTag.replace(/^v/, "");
-            core.info(`Ultimo release estavel: ${latestTag}`);
-            core.info(`Versao atual do app: ${appVersion}`);
-
-            if (latestVersion === appVersion) {
-              core.setFailed(
-                `Versao ${appVersion} ja foi publicada. Faca bump em Cargo.toml antes de publicar novo release.`
-              );
-            }
-
-      - name: Fail if tag already exists
+      - name: Detect if release should run
+        id: release_guard
         shell: pwsh
         env:
           RELEASE_TAG: ${{ steps.app_version.outputs.tag }}
@@ -74,29 +40,59 @@ jobs:
           $tag = $env:RELEASE_TAG
           $existing = git tag -l $tag
           if (-not [string]::IsNullOrWhiteSpace($existing)) {
-            Write-Error "Tag $tag ja existe. Atualize a versao no Cargo.toml para gerar novo release."
-            exit 1
+            Write-Host "Tag $tag ja existe. Este push sera concluido sem publicar novo release."
+            "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
           }
+          Write-Host "Tag $tag ainda nao existe. Release sera publicada."
+          "should_release=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Setup Rust
+        if: steps.release_guard.outputs.should_release == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
       - name: Install cargo-wix
+        if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         run: cargo install cargo-wix --locked
 
+      - name: Install WiX Toolset
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: pwsh
+        run: choco install wixtoolset --no-progress -y
+
+      - name: Configure WiX on PATH
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:WIX}\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.11\bin",
+            "C:\Program Files\WiX Toolset v3.11\bin"
+          )
+          $wixBin = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $wixBin) {
+            Write-Error "WiX Toolset instalado, mas pasta bin nao foi encontrada."
+            exit 1
+          }
+          "PATH=$wixBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "WiX configurado em $wixBin"
+
       - name: Build release binary
+        if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         run: cargo build --release --target x86_64-pc-windows-msvc
 
       - name: Build MSI
+        if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         run: cargo wix --no-build --target x86_64-pc-windows-msvc
 
       - name: Rename MSI artifact
         id: artifact
+        if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.app_version.outputs.version }}
@@ -112,6 +108,7 @@ jobs:
           "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Publish GitHub Release
+        if: steps.release_guard.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.app_version.outputs.tag }}
