@@ -71,7 +71,9 @@ fn resolve_icon_path() -> Option<PathBuf> {
     let exe_dir = exe_path.parent()?;
     let candidates = [
         exe_dir.join("assets").join(ICON_FILE_NAME),
-        exe_dir.parent().map(|p| p.join("assets").join(ICON_FILE_NAME))?,
+        exe_dir
+            .parent()
+            .map(|p| p.join("assets").join(ICON_FILE_NAME))?,
         exe_dir
             .parent()
             .and_then(|p| p.parent())

@@ -128,6 +128,39 @@ http://127.0.0.1:45890/playground
 {"id":"3","action":"sign_pdf","payload":{"filename":"doc.pdf","pdf_base64":"..."}}
 ```
 
+Com assinatura visivel opcional na primeira pagina:
+
+```json
+{
+  "id":"3",
+  "action":"sign_pdf",
+  "payload":{
+    "filename":"doc.pdf",
+    "pdf_base64":"...",
+    "visible_signature":{
+      "placement":"top_left_horizontal"
+    }
+  }
+}
+```
+
+Valores aceitos em `visible_signature.placement`:
+
+- `top_left_horizontal`
+- `top_left_vertical`
+- `top_right_horizontal`
+- `top_right_vertical`
+- `bottom_left_horizontal`
+- `bottom_left_vertical`
+- `bottom_right_horizontal`
+- `bottom_right_vertical`
+
+Observacoes:
+
+- `visible_signature` e opcional.
+- Quando ausente, a assinatura continua invisivel (comportamento legado).
+- Quando presente, a assinatura visivel e aplicada apenas na primeira pagina.
+
 ### Formato de resposta (sucesso)
 
 ```json

@@ -114,9 +114,9 @@ async fn run_server(
             )
         });
 
-    let root_redirect = warp::path::end().and(warp::get()).map(|| {
-        warp::redirect::temporary(warp::http::Uri::from_static("/playground"))
-    });
+    let root_redirect = warp::path::end()
+        .and(warp::get())
+        .map(|| warp::redirect::temporary(warp::http::Uri::from_static("/playground")));
 
     let ws_route = warp::path::full()
         .and(warp::ws())
@@ -374,10 +374,11 @@ async fn handle_sign_pdf(
     logger::info("Assinatura iniciada via WebSocket");
     let cert_override = state.config.cert_override.clone();
     let verbose = state.verbose;
+    let visible_signature = payload.visible_signature.clone();
     let started = Instant::now();
 
     let signing_task = tokio::task::spawn_blocking(move || {
-        signer::sign_single_pdf_bytes(&pdf_bytes, &cert_override, verbose)
+        signer::sign_single_pdf_bytes(&pdf_bytes, &cert_override, verbose, visible_signature)
     });
     let (result_tx, result_rx) =
         oneshot::channel::<std::result::Result<signer::WsSignResult, WsActionError>>();
@@ -535,6 +536,7 @@ struct SignPdfPayload {
     #[allow(dead_code)]
     filename: Option<String>,
     pdf_base64: String,
+    visible_signature: Option<signer::VisibleSignatureRequest>,
 }
 
 #[derive(Serialize)]
@@ -585,5 +587,38 @@ mod tests {
     fn invalid_request_without_action_fails() {
         let msg = Message::text("{\"id\":\"1\",\"payload\":{}}");
         assert!(parse_request_message(msg).is_err());
+    }
+
+    #[test]
+    fn sign_pdf_payload_accepts_visible_signature() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "visible_signature": {
+                "placement": "top_left_horizontal"
+            }
+        }));
+        assert!(payload.is_ok());
+    }
+
+    #[test]
+    fn sign_pdf_payload_accepts_without_visible_signature() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj"
+        }));
+        assert!(payload.is_ok());
+    }
+
+    #[test]
+    fn sign_pdf_payload_rejects_invalid_placement() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "visible_signature": {
+                "placement": "centro"
+            }
+        }));
+        assert!(payload.is_err());
     }
 }

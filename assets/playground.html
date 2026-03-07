@@ -62,7 +62,7 @@
       color: var(--muted);
       margin-bottom: 6px;
     }
-    input[type="text"], input[type="file"] {
+    input[type="text"], input[type="file"], select {
       width: 100%;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -169,6 +169,20 @@
               <label for="filePdf">Arquivo PDF</label>
               <input id="filePdf" type="file" accept="application/pdf" />
             </div>
+            <div>
+              <label for="visiblePlacement">Assinatura visivel</label>
+              <select id="visiblePlacement">
+                <option value="">invisivel (padrao)</option>
+                <option value="top_left_horizontal">top_left_horizontal</option>
+                <option value="top_left_vertical">top_left_vertical</option>
+                <option value="top_right_horizontal">top_right_horizontal</option>
+                <option value="top_right_vertical">top_right_vertical</option>
+                <option value="bottom_left_horizontal">bottom_left_horizontal</option>
+                <option value="bottom_left_vertical">bottom_left_vertical</option>
+                <option value="bottom_right_horizontal">bottom_right_horizontal</option>
+                <option value="bottom_right_vertical">bottom_right_vertical</option>
+              </select>
+            </div>
           </div>
           <div class="actions">
             <button id="btnSign" disabled>Assinar PDF</button>
@@ -202,6 +216,7 @@
     const wsUrlInput = document.getElementById("wsUrl");
     const tokenInput = document.getElementById("token");
     const filePdfInput = document.getElementById("filePdf");
+    const visiblePlacementInput = document.getElementById("visiblePlacement");
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
     const pdfViewer = document.getElementById("pdfViewer");
@@ -411,13 +426,19 @@
       }
       const base64 = btoa(binary);
 
+      const payload = {
+        filename: file.name,
+        pdf_base64: base64
+      };
+      const placement = visiblePlacementInput.value;
+      if (placement) {
+        payload.visible_signature = { placement };
+      }
+
       sendJson({
         id,
         action: "sign_pdf",
-        payload: {
-          filename: file.name,
-          pdf_base64: base64
-        }
+        payload
       });
       setStatus("Pedido de assinatura enviado.", "");
     });

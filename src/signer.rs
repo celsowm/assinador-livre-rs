@@ -1,8 +1,9 @@
 use crate::{config::CertOverride, logger};
 use anyhow::{bail, Context, Result};
-use chrono::Utc;
-use lopdf::Document;
+use chrono::{DateTime, Utc};
+use lopdf::{Document, Object, ObjectId};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
+use serde::Deserialize;
 use std::{
     env, fs,
     io::{self, Write as _},
@@ -27,6 +28,30 @@ pub struct WsSignResult {
     pub cert_thumbprint: String,
     pub cert_is_hardware_token: bool,
     pub cert_provider_name: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibleSignaturePlacement {
+    TopLeftHorizontal,
+    TopLeftVertical,
+    TopRightHorizontal,
+    TopRightVertical,
+    BottomLeftHorizontal,
+    BottomLeftVertical,
+    BottomRightHorizontal,
+    BottomRightVertical,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VisibleSignatureRequest {
+    pub placement: VisibleSignaturePlacement,
+}
+
+#[derive(Debug, Clone)]
+pub struct VisibleSignatureAppearance {
+    pub placement: VisibleSignaturePlacement,
+    pub signer_name: String,
 }
 
 pub struct OwnedCert {
@@ -98,12 +123,18 @@ pub fn sign_single_pdf_bytes(
     input: &[u8],
     cert_override: &CertOverride,
     verbose: bool,
+    visible_signature: Option<VisibleSignatureRequest>,
 ) -> Result<WsSignResult> {
     let certs = load_available_certificates()?;
     let cert_idx = choose_certificate_index(&certs, cert_override, verbose)?;
     let cert = &certs[cert_idx];
 
-    let signed_pdf = sign_pdf_bytes(input, cert.context)?;
+    let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
+        placement: cfg.placement,
+        signer_name: cert.subject.clone(),
+    });
+
+    let signed_pdf = sign_pdf_bytes(input, cert.context, visible_signature.as_ref())?;
 
     Ok(WsSignResult {
         signed_pdf,
@@ -117,15 +148,24 @@ pub fn sign_single_pdf_bytes(
 
 pub fn sign_pdf_file(input: &Path, output: &Path, cert_ctx: *const CERT_CONTEXT) -> Result<()> {
     let original = fs::read(input)?;
-    let signed = sign_pdf_bytes(&original, cert_ctx)
+    let signed = sign_pdf_bytes(&original, cert_ctx, None)
         .with_context(|| format!("Falha ao assinar {}", input.display()))?;
     fs::write(output, signed).with_context(|| format!("Falha ao gravar {}", output.display()))?;
     Ok(())
 }
 
-pub fn sign_pdf_bytes(input: &[u8], cert_ctx: *const CERT_CONTEXT) -> Result<Vec<u8>> {
+pub fn sign_pdf_bytes(
+    input: &[u8],
+    cert_ctx: *const CERT_CONTEXT,
+    visible_signature: Option<&VisibleSignatureAppearance>,
+) -> Result<Vec<u8>> {
+    const SIG_BYTES: usize = 12_288;
+    const HEX_LEN: usize = SIG_BYTES * 2;
+    const BR_PLACEHOLDER: &[u8] = b"/ByteRange [0 AAAAAAAAAA BBBBBBBBBB CCCCCCCCCC]";
+
     let original = input.to_vec();
     let doc = Document::load_mem(input).context("Falha ao abrir PDF em memoria")?;
+    let signed_at = Utc::now();
 
     let (cat_num, cat_gen) = doc
         .trailer
@@ -140,40 +180,46 @@ pub fn sign_pdf_bytes(input: &[u8], cert_ctx: *const CERT_CONTEXT) -> Result<Vec
         .as_dict()
         .context("/Catalog nao e dicionario")?;
 
-    let (pages_num, pages_gen) = catalog
-        .get(b"Pages")
-        .context("Catalog sem /Pages")?
-        .as_reference()
-        .context("/Pages nao e referencia")?;
+    let first_page_id = first_page_object_id(&doc)?;
+    let first_page_media_box = resolve_page_media_box(&doc, first_page_id)?;
+    let mut first_page_dict = doc
+        .get_object(first_page_id)
+        .context("Primeira pagina nao encontrada")?
+        .as_dict()
+        .context("Primeira pagina nao e dicionario")?
+        .clone();
 
-    let existing_fields: Vec<String> = catalog
-        .get(b"AcroForm")
-        .ok()
-        .and_then(|o| o.as_reference().ok())
-        .and_then(|id| doc.get_object(id).ok())
-        .and_then(|o| o.as_dict().ok())
-        .and_then(|d| d.get(b"Fields").ok())
-        .and_then(|f| f.as_array().ok())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|o| o.as_reference().ok())
-                .map(|(n, g)| format!("{n} {g} R"))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    const SIG_BYTES: usize = 12_288;
-    const HEX_LEN: usize = SIG_BYTES * 2;
-    const BR_PLACEHOLDER: &[u8] = b"/ByteRange [0 AAAAAAAAAA BBBBBBBBBB CCCCCCCCCC]";
-
+    let mut existing_fields = existing_acroform_fields(&doc, catalog);
     let next_obj = next_free_obj_num(&original)?;
     let sig_num = next_obj;
     let fld_num = next_obj + 1;
     let af_num = next_obj + 2;
+    let mut next_dynamic = af_num + 1;
+
+    let font_num = visible_signature.map(|_| {
+        let v = next_dynamic;
+        next_dynamic += 1;
+        v
+    });
+    let ap_num = visible_signature.map(|_| {
+        let v = next_dynamic;
+        next_dynamic += 1;
+        v
+    });
+
+    let widget_rect = visible_signature
+        .map(|cfg| compute_visible_signature_rect(first_page_media_box, cfg.placement))
+        .unwrap_or([0.0, 0.0, 0.0, 0.0]);
+
+    let mut annots = extract_page_annots(&doc, &first_page_dict);
+    annots.push(Object::Reference((fld_num, 0)));
+    first_page_dict.set("Annots", Object::Array(annots));
+    existing_fields.push(Object::Reference((fld_num, 0)));
 
     let mut upd = Vec::<u8>::new();
+    let mut xref_entries = Vec::<XrefEntry>::new();
 
-    let sig_off = original.len() + upd.len();
+    xref_entries.push(XrefEntry::new(sig_num, 0, original.len() + upd.len()));
     write!(upd, "{sig_num} 0 obj\n<<\n")?;
     write!(upd, "/Type /Sig\n")?;
     write!(upd, "/Filter /Adobe.PPKLite\n")?;
@@ -185,45 +231,101 @@ pub fn sign_pdf_bytes(input: &[u8], cert_ctx: *const CERT_CONTEXT) -> Result<Vec
     write!(upd, ">\n")?;
     write!(upd, "/Reason (Assinado digitalmente com Token A3)\n")?;
     write!(upd, "/Location (Brasil)\n")?;
-    write!(upd, "/M (D:{})\n", Utc::now().format("%Y%m%d%H%M%S+00'00'"))?;
+    write!(upd, "/M (D:{})\n", signed_at.format("%Y%m%d%H%M%S+00'00'"))?;
     write!(upd, ">>\nendobj\n")?;
 
-    let fld_off = original.len() + upd.len();
+    xref_entries.push(XrefEntry::new(fld_num, 0, original.len() + upd.len()));
     write!(upd, "{fld_num} 0 obj\n<<\n")?;
     write!(upd, "/Type /Annot\n/Subtype /Widget\n/FT /Sig\n")?;
     write!(upd, "/T (Assinatura_Digital_A3)\n")?;
     write!(upd, "/V {sig_num} 0 R\n")?;
-    write!(upd, "/Rect [0 0 0 0]\n")?;
-    write!(upd, "/P {pages_num} {pages_gen} R\n")?;
+    write!(
+        upd,
+        "/Rect [{:.2} {:.2} {:.2} {:.2}]\n",
+        widget_rect[0], widget_rect[1], widget_rect[2], widget_rect[3]
+    )?;
+    write!(upd, "/P {} {} R\n", first_page_id.0, first_page_id.1)?;
+    if let Some(ap_num) = ap_num {
+        write!(upd, "/F 4\n")?;
+        write!(upd, "/AP << /N {ap_num} 0 R >>\n")?;
+    }
     write!(upd, ">>\nendobj\n")?;
 
-    let af_off = original.len() + upd.len();
-    let all_fields = {
-        let mut v = existing_fields.clone();
-        v.push(format!("{fld_num} 0 R"));
-        v.join(" ")
-    };
+    xref_entries.push(XrefEntry::new(af_num, 0, original.len() + upd.len()));
+    let all_fields = existing_fields
+        .iter()
+        .map(|obj| format!("{obj:?}"))
+        .collect::<Vec<String>>()
+        .join(" ");
     write!(upd, "{af_num} 0 obj\n<<\n")?;
     write!(upd, "/Fields [{all_fields}]\n/SigFlags 3\n")?;
     write!(upd, ">>\nendobj\n")?;
 
-    let cat_off = original.len() + upd.len();
-    write!(upd, "{cat_num} {cat_gen} obj\n<<\n")?;
-    write!(upd, "/Type /Catalog\n")?;
-    write!(upd, "/Pages {pages_num} {pages_gen} R\n")?;
-    write!(upd, "/AcroForm {af_num} 0 R\n")?;
-    write!(upd, ">>\nendobj\n")?;
+    if let Some(font_num) = font_num {
+        xref_entries.push(XrefEntry::new(font_num, 0, original.len() + upd.len()));
+        write!(upd, "{font_num} 0 obj\n<<\n")?;
+        write!(upd, "/Type /Font\n/Subtype /Type1\n/BaseFont /Helvetica\n")?;
+        write!(upd, ">>\nendobj\n")?;
+    }
+
+    if let (Some(ap_num), Some(font_num), Some(visible_cfg)) = (ap_num, font_num, visible_signature)
+    {
+        let appearance =
+            build_visible_signature_appearance(widget_rect, &visible_cfg.signer_name, signed_at);
+        xref_entries.push(XrefEntry::new(ap_num, 0, original.len() + upd.len()));
+        write!(upd, "{ap_num} 0 obj\n<<\n")?;
+        write!(upd, "/Type /XObject\n/Subtype /Form\n")?;
+        write!(
+            upd,
+            "/BBox [0 0 {:.2} {:.2}]\n",
+            widget_rect[2] - widget_rect[0],
+            widget_rect[3] - widget_rect[1]
+        )?;
+        write!(upd, "/Resources << /Font << /F1 {font_num} 0 R >> >>\n")?;
+        write!(upd, "/Length {}\n", appearance.len())?;
+        write!(upd, ">>\nstream\n")?;
+        upd.extend_from_slice(&appearance);
+        write!(upd, "\nendstream\nendobj\n")?;
+    }
+
+    xref_entries.push(XrefEntry::new(
+        first_page_id.0,
+        first_page_id.1,
+        original.len() + upd.len(),
+    ));
+    write!(upd, "{} {} obj\n", first_page_id.0, first_page_id.1)?;
+    write!(upd, "{:?}\n", Object::Dictionary(first_page_dict))?;
+    write!(upd, "endobj\n")?;
+
+    let mut catalog_updated = catalog.clone();
+    catalog_updated.set("AcroForm", Object::Reference((af_num, 0)));
+    xref_entries.push(XrefEntry::new(cat_num, cat_gen, original.len() + upd.len()));
+    write!(upd, "{cat_num} {cat_gen} obj\n")?;
+    write!(upd, "{:?}\n", Object::Dictionary(catalog_updated))?;
+    write!(upd, "endobj\n")?;
 
     let xref_off = original.len() + upd.len();
     write!(upd, "\nxref\n")?;
-    write!(upd, "{next_obj} 3\n")?;
-    write!(upd, "{sig_off:010} 00000 n \n")?;
-    write!(upd, "{fld_off:010} 00000 n \n")?;
-    write!(upd, "{af_off:010} 00000 n \n")?;
-    write!(upd, "{cat_num} 1\n")?;
-    write!(upd, "{cat_off:010} {cat_gen:05} n \n")?;
+    xref_entries.sort_by_key(|entry| entry.obj_num);
+
+    let mut idx = 0usize;
+    while idx < xref_entries.len() {
+        let start = xref_entries[idx].obj_num;
+        let mut end = idx + 1;
+        while end < xref_entries.len()
+            && xref_entries[end].obj_num == xref_entries[end - 1].obj_num + 1
+        {
+            end += 1;
+        }
+        write!(upd, "{start} {}\n", end - idx)?;
+        for entry in &xref_entries[idx..end] {
+            write!(upd, "{:010} {:05} n \n", entry.offset, entry.generation)?;
+        }
+        idx = end;
+    }
+
     write!(upd, "trailer\n<<\n")?;
-    write!(upd, "/Size {}\n", next_obj + 3)?;
+    write!(upd, "/Size {}\n", next_dynamic)?;
     write!(upd, "/Root {cat_num} {cat_gen} R\n")?;
     write!(upd, "/Prev {}\n", original.len())?;
     write!(upd, ">>\nstartxref\n{xref_off}\n%%EOF\n")?;
@@ -266,6 +368,215 @@ pub fn sign_pdf_bytes(input: &[u8], cert_ctx: *const CERT_CONTEXT) -> Result<Vec
     pdf[contents_pos..contents_pos + HEX_LEN].copy_from_slice(hex_padded.as_bytes());
 
     Ok(pdf)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct XrefEntry {
+    obj_num: u32,
+    generation: u16,
+    offset: usize,
+}
+
+impl XrefEntry {
+    fn new(obj_num: u32, generation: u16, offset: usize) -> Self {
+        Self {
+            obj_num,
+            generation,
+            offset,
+        }
+    }
+}
+
+fn first_page_object_id(doc: &Document) -> Result<ObjectId> {
+    doc.get_pages()
+        .into_iter()
+        .next()
+        .map(|(_, id)| id)
+        .context("PDF nao possui paginas")
+}
+
+fn existing_acroform_fields(doc: &Document, catalog: &lopdf::Dictionary) -> Vec<Object> {
+    match catalog.get(b"AcroForm") {
+        Ok(acro_form) => {
+            let acro_dict = if let Ok(id) = acro_form.as_reference() {
+                doc.get_object(id).ok().and_then(|o| o.as_dict().ok())
+            } else {
+                acro_form.as_dict().ok()
+            };
+
+            acro_dict
+                .and_then(|d| d.get(b"Fields").ok())
+                .and_then(|f| f.as_array().ok())
+                .cloned()
+                .unwrap_or_default()
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn resolve_page_media_box(doc: &Document, page_id: ObjectId) -> Result<[f32; 4]> {
+    let mut current = Some(page_id);
+    while let Some(object_id) = current {
+        let dict = doc
+            .get_object(object_id)
+            .context("Objeto de pagina nao encontrado")?
+            .as_dict()
+            .context("Objeto de pagina nao e dicionario")?;
+
+        if let Ok(media_box) = dict.get(b"MediaBox") {
+            let array = if let Ok(reference) = media_box.as_reference() {
+                doc.get_object(reference)
+                    .context("Referencia de MediaBox nao encontrada")?
+                    .as_array()
+                    .context("MediaBox referenciado nao e array")?
+                    .clone()
+            } else {
+                media_box
+                    .as_array()
+                    .context("MediaBox nao e array")?
+                    .clone()
+            };
+            return parse_rect_array(&array);
+        }
+
+        current = dict.get(b"Parent").ok().and_then(|p| p.as_reference().ok());
+    }
+
+    bail!("Primeira pagina sem MediaBox")
+}
+
+fn parse_rect_array(arr: &[Object]) -> Result<[f32; 4]> {
+    if arr.len() != 4 {
+        bail!(
+            "Retangulo invalido: esperado 4 numeros, recebido {}",
+            arr.len()
+        );
+    }
+
+    Ok([
+        object_to_f32(&arr[0])?,
+        object_to_f32(&arr[1])?,
+        object_to_f32(&arr[2])?,
+        object_to_f32(&arr[3])?,
+    ])
+}
+
+fn object_to_f32(obj: &Object) -> Result<f32> {
+    match obj {
+        Object::Integer(v) => Ok(*v as f32),
+        Object::Real(v) => Ok(*v),
+        _ => bail!("Valor numerico invalido em retangulo"),
+    }
+}
+
+fn extract_page_annots(doc: &Document, page_dict: &lopdf::Dictionary) -> Vec<Object> {
+    let annots_obj = match page_dict.get(b"Annots") {
+        Ok(obj) => obj,
+        Err(_) => return Vec::new(),
+    };
+
+    if let Ok(array) = annots_obj.as_array() {
+        return array.clone();
+    }
+
+    if let Ok(reference) = annots_obj.as_reference()
+        && let Ok(array) = doc.get_object(reference).and_then(|o| o.as_array())
+    {
+        return array.clone();
+    }
+
+    Vec::new()
+}
+
+fn compute_visible_signature_rect(
+    media_box: [f32; 4],
+    placement: VisibleSignaturePlacement,
+) -> [f32; 4] {
+    const MARGIN: f32 = 24.0;
+    const H_WIDTH: f32 = 220.0;
+    const H_HEIGHT: f32 = 72.0;
+    const V_WIDTH: f32 = 110.0;
+    const V_HEIGHT: f32 = 180.0;
+
+    let (target_w, target_h) = match placement {
+        VisibleSignaturePlacement::TopLeftHorizontal
+        | VisibleSignaturePlacement::TopRightHorizontal
+        | VisibleSignaturePlacement::BottomLeftHorizontal
+        | VisibleSignaturePlacement::BottomRightHorizontal => (H_WIDTH, H_HEIGHT),
+        VisibleSignaturePlacement::TopLeftVertical
+        | VisibleSignaturePlacement::TopRightVertical
+        | VisibleSignaturePlacement::BottomLeftVertical
+        | VisibleSignaturePlacement::BottomRightVertical => (V_WIDTH, V_HEIGHT),
+    };
+
+    let llx = media_box[0];
+    let lly = media_box[1];
+    let urx = media_box[2];
+    let ury = media_box[3];
+
+    let usable_w = (urx - llx - 2.0 * MARGIN).max(20.0);
+    let usable_h = (ury - lly - 2.0 * MARGIN).max(20.0);
+    let width = target_w.min(usable_w);
+    let height = target_h.min(usable_h);
+
+    let x = match placement {
+        VisibleSignaturePlacement::TopLeftHorizontal
+        | VisibleSignaturePlacement::TopLeftVertical
+        | VisibleSignaturePlacement::BottomLeftHorizontal
+        | VisibleSignaturePlacement::BottomLeftVertical => llx + MARGIN,
+        VisibleSignaturePlacement::TopRightHorizontal
+        | VisibleSignaturePlacement::TopRightVertical
+        | VisibleSignaturePlacement::BottomRightHorizontal
+        | VisibleSignaturePlacement::BottomRightVertical => urx - MARGIN - width,
+    };
+
+    let y = match placement {
+        VisibleSignaturePlacement::TopLeftHorizontal
+        | VisibleSignaturePlacement::TopLeftVertical
+        | VisibleSignaturePlacement::TopRightHorizontal
+        | VisibleSignaturePlacement::TopRightVertical => ury - MARGIN - height,
+        VisibleSignaturePlacement::BottomLeftHorizontal
+        | VisibleSignaturePlacement::BottomLeftVertical
+        | VisibleSignaturePlacement::BottomRightHorizontal
+        | VisibleSignaturePlacement::BottomRightVertical => lly + MARGIN,
+    };
+
+    [x, y, x + width, y + height]
+}
+
+fn build_visible_signature_appearance(
+    rect: [f32; 4],
+    signer_name: &str,
+    signed_at: DateTime<Utc>,
+) -> Vec<u8> {
+    let width = rect[2] - rect[0];
+    let height = rect[3] - rect[1];
+    let line1 = escape_pdf_literal("Assinado digitalmente");
+    let line2 = escape_pdf_literal(&truncate_text(
+        &format!("Assinante: {}", signer_name.trim()),
+        80,
+    ));
+    let line3 = escape_pdf_literal(&format!(
+        "Data/Hora: {}",
+        signed_at.format("%d/%m/%Y %H:%M:%S UTC")
+    ));
+    let baseline = (height - 18.0).max(20.0);
+
+    format!(
+        "q\n1 1 0.93 rg\n0 0 {width:.2} {height:.2} re\nf\n0 0 0 RG\n1 w\n0 0 {width:.2} {height:.2} re\nS\nBT\n/F1 11 Tf\n0 0 0 rg\n8 {baseline:.2} Td\n({line1}) Tj\n0 -15 Td\n({line2}) Tj\n0 -15 Td\n({line3}) Tj\nET\nQ\n"
+    )
+    .into_bytes()
+}
+
+fn truncate_text(input: &str, limit: usize) -> String {
+    input.chars().take(limit).collect()
+}
+
+fn escape_pdf_literal(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('(', "\\(")
+        .replace(')', "\\)")
 }
 
 pub fn normalize_thumbprint(raw: &str) -> String {
@@ -474,7 +785,10 @@ fn certificate_score(cert: &OwnedCert) -> (i32, Vec<String>) {
     }
     if contains_any(
         &provider_lc,
-        &["software key storage provider", "software cryptographic provider"],
+        &[
+            "software key storage provider",
+            "software cryptographic provider",
+        ],
     ) {
         score -= 500;
         reasons.push("-500 provider de software (sem token)".to_string());
@@ -669,10 +983,8 @@ fn list_my_certificates() -> Result<Vec<OwnedCert>> {
             let valid_now = cert_is_valid_now(ctx);
             let supports_digital_signature = cert_supports_digital_signature(ctx);
             let key_info = cert_key_provider_info(ctx).unwrap_or_default();
-            let is_hardware_token = looks_like_hardware_token(
-                &key_info.provider_name,
-                &key_info.container_name,
-            );
+            let is_hardware_token =
+                looks_like_hardware_token(&key_info.provider_name, &key_info.container_name);
 
             let owned_ctx = CertDuplicateCertificateContext(Some(ctx as *const CERT_CONTEXT));
             if owned_ctx.is_null() {
@@ -815,7 +1127,7 @@ fn looks_like_hardware_token(provider_name: &str, container_name: &str) -> bool 
     false
 }
 
-unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String {
+unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String { unsafe {
     if ptr.is_null() {
         return String::new();
     }
@@ -831,9 +1143,9 @@ unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String {
 
     let slice = slice::from_raw_parts(ptr, len);
     String::from_utf16_lossy(slice)
-}
+}}
 
-unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String {
+unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String { unsafe {
     let len = CertGetNameStringW(ctx, name_type, flags, None, None);
     if len <= 1 {
         return String::new();
@@ -843,11 +1155,11 @@ unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) ->
     let _ = CertGetNameStringW(ctx, name_type, flags, None, Some(&mut buf));
 
     String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)])
-}
+}}
 
 static SHA256_OID: &[u8] = b"2.16.840.1.101.3.4.2.1\0";
 
-unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) -> Result<Vec<u8>> {
+unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) -> Result<Vec<u8>> { unsafe {
     const ENCODING: u32 = X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0;
 
     let hash_alg = CRYPT_ALGORITHM_IDENTIFIER {
@@ -908,7 +1220,7 @@ unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) 
 
     sig.truncate(sig_len as usize);
     Ok(sig)
-}
+}}
 
 fn file_name(p: &Path) -> String {
     p.file_name()
@@ -958,4 +1270,27 @@ fn find_contents_hex_start(pdf: &[u8], from: usize) -> Option<usize> {
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_top_left_horizontal_rect() {
+        let rect = compute_visible_signature_rect(
+            [0.0, 0.0, 612.0, 792.0],
+            VisibleSignaturePlacement::TopLeftHorizontal,
+        );
+        assert_eq!(rect, [24.0, 696.0, 244.0, 768.0]);
+    }
+
+    #[test]
+    fn computes_bottom_right_vertical_rect() {
+        let rect = compute_visible_signature_rect(
+            [0.0, 0.0, 612.0, 792.0],
+            VisibleSignaturePlacement::BottomRightVertical,
+        );
+        assert_eq!(rect, [478.0, 24.0, 588.0, 204.0]);
+    }
 }

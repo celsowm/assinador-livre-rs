@@ -163,9 +163,7 @@ fn open_playground_from_tray(state: &Arc<SharedState>) {
 
     logger::info(format!("Abrindo playground no navegador: {url}"));
 
-    let open_result = Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .spawn();
+    let open_result = Command::new("cmd").args(["/C", "start", "", &url]).spawn();
 
     if let Err(e) = open_result {
         logger::error(format!("Falha ao abrir playground no navegador: {e:#}"));
