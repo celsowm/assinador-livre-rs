@@ -7,6 +7,7 @@ Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via 
 - Roda residente na bandeja do Windows.
 - Menu com:
   - `Assinar documento`
+  - `Abrir playground`
   - `Sair`
 - Assina PDFs com certificado do repositorio `MY` (Minhas) do Windows.
 - Expoe WebSocket local para uma aplicacao web detectar o app e solicitar assinatura.
@@ -80,7 +81,8 @@ Exemplo:
 
 ### Regras de certificado (`cert_override`)
 
-- `mode=auto`: usa ranking automatico.
+- `mode=auto`: usa ranking automatico e prioriza certificado de token/smart card quando existir.
+- `mode=token_only`: exige certificado de token/smart card; falha se nao encontrar.
 - `thumbprint` preenchido: tenta certificado especifico; se nao encontrar, cai para auto.
 - `index` preenchido: forca indice (1-based) da lista de certificados.
 
@@ -92,10 +94,17 @@ Endpoint padrao:
 ws://127.0.0.1:45890/ws
 ```
 
+Playground local (HTTP, mesma porta do WS):
+
+```text
+http://127.0.0.1:45890/playground
+```
+
 ### Regras de seguranca
 
 - Bind apenas em localhost (`ws_host`).
 - `Origin` deve estar em `allowed_origins`.
+- A origem local do playground (`http://<ws_host>:<ws_port>`) e aliases locais comuns (`localhost`/`127.0.0.1`) tambem sao aceitos.
 - Primeira mensagem obrigatoriamente `auth` em ate 3 segundos.
 - Token deve bater com `ws_token`.
 
@@ -146,11 +155,26 @@ ws://127.0.0.1:45890/ws
 - Timeout de autenticacao: 3s.
 - Timeout de assinatura: 120s.
 
+## Playground WebSocket local
+
+Use o endpoint HTTP local para testar o protocolo sem app web externa:
+
+1. Inicie o app em modo bandeja.
+2. Abra `http://127.0.0.1:45890/playground` no navegador.
+3. Clique em `Conectar`.
+4. Clique em `Autenticar` (token predefinido para dev: `troque-este-token`).
+5. Teste `Ping` e `Assinar PDF`.
+
+Observacao importante:
+
+- O token predefinido do playground e apenas para desenvolvimento local.
+- Em producao, altere `ws_token` no `config.json`.
+
 ## Fluxo de bandeja
 
 1. Inicie o app sem argumentos.
 2. Clique direito no icone da bandeja.
-3. Clique em `Assinar documento`.
+3. Clique em `Abrir playground` para abrir `http://127.0.0.1:45890/playground` no navegador; ou clique em `Assinar documento`.
 4. Selecione um ou mais PDFs.
 5. Arquivos assinados sao gravados como `*_assinado.pdf` no mesmo diretorio.
 

@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use single_instance::SingleInstance;
-use std::{env, sync::Arc};
+use std::{env, process::Command, sync::Arc};
 use tokio::sync::Semaphore;
 use winreg::{enums::HKEY_CURRENT_USER, RegKey};
 
@@ -102,6 +102,9 @@ fn run_tray_mode(loaded: LoadedConfig, verbose: bool) -> Result<()> {
             Ok(TrayCommand::SignDocument) => {
                 handle_sign_from_tray(&state);
             }
+            Ok(TrayCommand::OpenPlayground) => {
+                open_playground_from_tray(&state);
+            }
             Ok(TrayCommand::Exit) => {
                 logger::info("Comando de saida recebido pela bandeja");
                 break;
@@ -150,6 +153,31 @@ fn handle_sign_from_tray(state: &Arc<SharedState>) {
     }
 
     drop(permit);
+}
+
+fn open_playground_from_tray(state: &Arc<SharedState>) {
+    let url = format!(
+        "http://{}:{}/playground",
+        state.config.ws_host, state.config.ws_port
+    );
+
+    logger::info(format!("Abrindo playground no navegador: {url}"));
+
+    let open_result = Command::new("cmd")
+        .args(["/C", "start", "", &url])
+        .spawn();
+
+    if let Err(e) = open_result {
+        logger::error(format!("Falha ao abrir playground no navegador: {e:#}"));
+        MessageDialog::new()
+            .set_title("Erro ao abrir playground")
+            .set_description(format!(
+                "Nao foi possivel abrir o navegador automaticamente.\nURL: {url}\n\nErro: {e:#}"
+            ))
+            .set_level(MessageLevel::Error)
+            .set_buttons(MessageButtons::Ok)
+            .show();
+    }
 }
 
 fn parse_args() -> CliArgs {

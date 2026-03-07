@@ -5,28 +5,28 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    convert::Infallible,
+    net::SocketAddr,
     sync::{mpsc, Arc},
     thread,
     time::Duration,
 };
 use tokio::{
-    net::{TcpListener, TcpStream},
     sync::oneshot,
-    time::timeout,
-};
-use tokio_tungstenite::{
-    accept_hdr_async_with_config,
-    tungstenite::{
-        handshake::server::{ErrorResponse, Request, Response},
-        http::{Response as HttpResponse, StatusCode},
-        protocol::{Message, WebSocketConfig},
-    },
+    time::{timeout, Instant},
 };
 use uuid::Uuid;
+use warp::{
+    filters::path::FullPath,
+    http::StatusCode,
+    ws::{Message, WebSocket, Ws},
+    Filter, Reply,
+};
 
 const MAX_BASE64_SIZE: usize = 20 * 1024 * 1024;
 const AUTH_TIMEOUT_SECS: u64 = 3;
 const SIGN_TIMEOUT_SECS: u64 = 120;
+const PLAYGROUND_HTML: &str = include_str!("../assets/playground.html");
 
 pub struct WsServerHandle {
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -86,85 +86,136 @@ pub fn spawn_server(state: Arc<SharedState>) -> Result<WsServerHandle> {
 
 async fn run_server(
     state: Arc<SharedState>,
-    mut shutdown_rx: oneshot::Receiver<()>,
+    shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
     let bind_addr = format!("{}:{}", state.config.ws_host, state.config.ws_port);
-    let listener = match TcpListener::bind(&bind_addr).await {
-        Ok(listener) => listener,
+    let socket_addr: SocketAddr = match bind_addr.parse() {
+        Ok(addr) => addr,
         Err(err) => {
-            let msg = format!("Falha ao escutar em {bind_addr}: {err:#}");
+            let msg = format!("Endereco de bind invalido ({bind_addr}): {err:#}");
             let _ = ready_tx.send(Err(msg.clone()));
             return Err(anyhow::anyhow!(msg));
         }
     };
+
+    let expected_path = state.config.normalized_ws_path();
+    let allowed_origins = state.config.normalized_allowed_origins();
+    let local_origins = default_local_origins(&state.config.ws_host, state.config.ws_port);
+
+    let playground_route = warp::path("playground")
+        .and(warp::path::end())
+        .and(warp::get())
+        .map(|| {
+            warp::reply::with_header(
+                warp::reply::html(PLAYGROUND_HTML),
+                "Cache-Control",
+                "no-store",
+            )
+        });
+
+    let root_redirect = warp::path::end().and(warp::get()).map(|| {
+        warp::redirect::temporary(warp::http::Uri::from_static("/playground"))
+    });
+
+    let ws_route = warp::path::full()
+        .and(warp::ws())
+        .and(warp::header::optional::<String>("origin"))
+        .and(with_state(state.clone()))
+        .and(with_expected_path(expected_path.clone()))
+        .and(with_allowed_origins(allowed_origins.clone()))
+        .and(with_local_origins(local_origins.clone()))
+        .and_then(
+            |full: FullPath,
+             ws: Ws,
+             origin: Option<String>,
+             state: Arc<SharedState>,
+             expected_path: String,
+             allowed_origins: Vec<String>,
+             local_origins: Vec<String>| async move {
+                route_ws(
+                    full,
+                    ws,
+                    origin,
+                    state,
+                    expected_path,
+                    allowed_origins,
+                    local_origins,
+                )
+                .await
+            },
+        );
+
+    let routes = playground_route.or(root_redirect).or(ws_route).with(
+        warp::cors()
+            .allow_methods(vec!["GET", "OPTIONS"])
+            .allow_headers(vec!["content-type"]),
+    );
+
+    let (server_addr, server) =
+        warp::serve(routes).bind_with_graceful_shutdown(socket_addr, async move {
+            let _ = shutdown_rx.await;
+            logger::info("Shutdown do servidor local (HTTP/WS) recebido");
+        });
+
     let _ = ready_tx.send(Ok(()));
+    logger::info(format!(
+        "Servidor local ouvindo em ws://{}:{}{} e http://{}:{}/playground",
+        state.config.ws_host,
+        state.config.ws_port,
+        expected_path,
+        server_addr.ip(),
+        server_addr.port()
+    ));
 
-    logger::info(format!("WebSocket ouvindo em {}", state.config.endpoint()));
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => {
-                logger::info("Shutdown do WebSocket recebido");
-                break;
-            }
-            incoming = listener.accept() => {
-                let (stream, addr) = match incoming {
-                    Ok(v) => v,
-                    Err(err) => {
-                        logger::warn(format!("Falha ao aceitar conexao WS: {err:#}"));
-                        continue;
-                    }
-                };
-
-                let conn_state = state.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_connection(stream, conn_state).await {
-                        logger::warn(format!("Conexao WS {} encerrada com erro: {err:#}", addr));
-                    }
-                });
-            }
-        }
-    }
-
+    server.await;
     Ok(())
 }
 
-async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Result<()> {
-    let expected_path = state.config.normalized_ws_path();
-    let allowed_origins = state.config.normalized_allowed_origins();
+async fn route_ws(
+    full: FullPath,
+    ws: Ws,
+    origin: Option<String>,
+    state: Arc<SharedState>,
+    expected_path: String,
+    allowed_origins: Vec<String>,
+    local_origins: Vec<String>,
+) -> std::result::Result<warp::reply::Response, warp::Rejection> {
+    if full.as_str() != expected_path {
+        return Err(warp::reject::not_found());
+    }
 
-    let callback =
-        move |req: &Request, response: Response| -> std::result::Result<Response, ErrorResponse> {
-            if req.uri().path() != expected_path {
-                return Err(reject(StatusCode::NOT_FOUND, "INVALID_PATH"));
+    let normalized_origin = origin.as_ref().map(|v| v.trim().to_ascii_lowercase());
+    let origin_allowed = normalized_origin
+        .as_ref()
+        .map(|origin| {
+            is_origin_allowed(origin, &allowed_origins)
+                || local_origins.iter().any(|candidate| candidate == origin)
+        })
+        .unwrap_or(false);
+
+    if !origin_allowed {
+        let reply = warp::reply::with_status("ORIGIN_NOT_ALLOWED", StatusCode::FORBIDDEN);
+        return Ok(reply.into_response());
+    }
+
+    let response = ws
+        .max_message_size(22 * 1024 * 1024)
+        .max_frame_size(22 * 1024 * 1024)
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = handle_socket(socket, state).await {
+                logger::warn(format!("Conexao WS encerrada com erro: {err:#}"));
             }
+        })
+        .into_response();
 
-            let origin = req
-                .headers()
-                .get("Origin")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.to_ascii_lowercase());
+    Ok(response)
+}
 
-            match origin {
-                Some(origin) if is_origin_allowed(&origin, &allowed_origins) => Ok(response),
-                _ => Err(reject(StatusCode::FORBIDDEN, "ORIGIN_NOT_ALLOWED")),
-            }
-        };
-
-    let ws_cfg = Some(
-        WebSocketConfig::default()
-            .max_message_size(Some(22 * 1024 * 1024))
-            .max_frame_size(Some(22 * 1024 * 1024)),
-    );
-
-    let ws_stream = accept_hdr_async_with_config(stream, callback, ws_cfg)
-        .await
-        .context("Handshake WS rejeitado")?;
-
+async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
     logger::info("Cliente WS conectado");
 
-    let (mut sink, mut stream) = ws_stream.split();
+    let (mut sink, mut stream) = ws.split();
 
     let first_message = match timeout(Duration::from_secs(AUTH_TIMEOUT_SECS), stream.next()).await {
         Ok(Some(Ok(message))) => message,
@@ -195,6 +246,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Result
             return Ok(());
         }
     };
+
     let auth_id = auth_req.id.clone();
     if auth_req.action != "auth" {
         send_error(
@@ -262,6 +314,9 @@ async fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> Result
                             "signed_pdf_base64": STANDARD.encode(result.signed_pdf),
                             "cert_subject": result.cert_subject,
                             "cert_issuer": result.cert_issuer,
+                            "cert_thumbprint": result.cert_thumbprint,
+                            "cert_is_hardware_token": result.cert_is_hardware_token,
+                            "cert_provider_name": result.cert_provider_name,
                         }),
                     )
                     .await?;
@@ -319,6 +374,7 @@ async fn handle_sign_pdf(
     logger::info("Assinatura iniciada via WebSocket");
     let cert_override = state.config.cert_override.clone();
     let verbose = state.verbose;
+    let started = Instant::now();
 
     let signing_task = tokio::task::spawn_blocking(move || {
         signer::sign_single_pdf_bytes(&pdf_bytes, &cert_override, verbose)
@@ -336,7 +392,13 @@ async fn handle_sign_pdf(
     });
 
     match timeout(Duration::from_secs(SIGN_TIMEOUT_SECS), result_rx).await {
-        Ok(Ok(result)) => result,
+        Ok(Ok(result)) => {
+            logger::info(format!(
+                "Assinatura WS concluida em {} ms",
+                started.elapsed().as_millis()
+            ));
+            result
+        }
         Ok(Err(_)) => Err(WsActionError::Signing(
             "Falha ao receber retorno da assinatura".to_string(),
         )),
@@ -345,21 +407,28 @@ async fn handle_sign_pdf(
 }
 
 fn parse_request_message(message: Message) -> Result<ClientRequest> {
-    let text = match message {
-        Message::Text(text) => text,
-        Message::Binary(_) => return bail_invalid("Mensagem binaria nao suportada"),
-        Message::Ping(_) | Message::Pong(_) => {
-            return bail_invalid("Frame de controle nao esperado")
-        }
-        Message::Close(_) => return bail_invalid("Conexao encerrada"),
-        Message::Frame(_) => return bail_invalid("Frame bruto nao suportado"),
-    };
+    if message.is_close() {
+        return bail_invalid("Conexao encerrada");
+    }
+    if message.is_ping() || message.is_pong() {
+        return bail_invalid("Frame de controle nao esperado");
+    }
+    if message.is_binary() {
+        return bail_invalid("Mensagem binaria nao suportada");
+    }
+    if !message.is_text() {
+        return bail_invalid("Tipo de mensagem nao suportado");
+    }
+
+    let text = message
+        .to_str()
+        .map_err(|_| anyhow::anyhow!("Mensagem de texto invalida"))?;
 
     if text.len() > 22 * 1024 * 1024 {
         return bail_invalid("Mensagem excede limite maximo permitido");
     }
 
-    let req: ClientRequest = serde_json::from_str(text.as_ref()).context("JSON invalido")?;
+    let req: ClientRequest = serde_json::from_str(text).context("JSON invalido")?;
 
     if req.action.trim().is_empty() {
         return bail_invalid("Campo action obrigatorio");
@@ -368,23 +437,48 @@ fn parse_request_message(message: Message) -> Result<ClientRequest> {
     Ok(req)
 }
 
-fn reject(status: StatusCode, body: &str) -> ErrorResponse {
-    HttpResponse::builder()
-        .status(status)
-        .body(Some(body.to_string()))
-        .expect("falha ao construir resposta HTTP")
-}
-
 pub fn is_origin_allowed(origin: &str, allowed_origins: &[String]) -> bool {
     let normalized = origin.trim().to_ascii_lowercase();
     allowed_origins.iter().any(|allowed| allowed == &normalized)
 }
 
+fn default_local_origins(host: &str, port: u16) -> Vec<String> {
+    let mut values = vec![
+        format!("http://{host}:{port}").to_ascii_lowercase(),
+        format!("http://localhost:{port}").to_ascii_lowercase(),
+        format!("http://127.0.0.1:{port}").to_ascii_lowercase(),
+    ];
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn with_state(
+    state: Arc<SharedState>,
+) -> impl Filter<Extract = (Arc<SharedState>,), Error = Infallible> + Clone {
+    warp::any().map(move || state.clone())
+}
+
+fn with_expected_path(
+    expected_path: String,
+) -> impl Filter<Extract = (String,), Error = Infallible> + Clone {
+    warp::any().map(move || expected_path.clone())
+}
+
+fn with_allowed_origins(
+    allowed_origins: Vec<String>,
+) -> impl Filter<Extract = (Vec<String>,), Error = Infallible> + Clone {
+    warp::any().map(move || allowed_origins.clone())
+}
+
+fn with_local_origins(
+    local_origins: Vec<String>,
+) -> impl Filter<Extract = (Vec<String>,), Error = Infallible> + Clone {
+    warp::any().map(move || local_origins.clone())
+}
+
 async fn send_ok(
-    sink: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-        Message,
-    >,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     id: Option<String>,
     result: Value,
 ) -> Result<()> {
@@ -395,15 +489,12 @@ async fn send_ok(
     };
 
     let text = serde_json::to_string(&response)?;
-    sink.send(Message::Text(text.into())).await?;
+    sink.send(Message::text(text)).await?;
     Ok(())
 }
 
 async fn send_error(
-    sink: &mut futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<TcpStream>,
-        Message,
-    >,
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     id: Option<String>,
     code: &str,
     message: &str,
@@ -418,7 +509,7 @@ async fn send_error(
     };
 
     let text = serde_json::to_string(&response)?;
-    sink.send(Message::Text(text.into())).await?;
+    sink.send(Message::text(text)).await?;
     Ok(())
 }
 
@@ -484,8 +575,15 @@ mod tests {
     }
 
     #[test]
+    fn local_origin_list_has_defaults() {
+        let values = default_local_origins("127.0.0.1", 45890);
+        assert!(values.contains(&"http://127.0.0.1:45890".to_string()));
+        assert!(values.contains(&"http://localhost:45890".to_string()));
+    }
+
+    #[test]
     fn invalid_request_without_action_fails() {
-        let msg = Message::Text("{\"id\":\"1\",\"payload\":{}}".to_string().into());
+        let msg = Message::text("{\"id\":\"1\",\"payload\":{}}");
         assert!(parse_request_message(msg).is_err());
     }
 }

@@ -1,4 +1,4 @@
-use crate::config::CertOverride;
+use crate::{config::CertOverride, logger};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use lopdf::Document;
@@ -8,6 +8,7 @@ use std::{
     io::{self, Write as _},
     mem,
     path::{Path, PathBuf},
+    slice,
 };
 use windows::{
     core::{w, PSTR},
@@ -23,6 +24,9 @@ pub struct WsSignResult {
     pub signed_pdf: Vec<u8>,
     pub cert_subject: String,
     pub cert_issuer: String,
+    pub cert_thumbprint: String,
+    pub cert_is_hardware_token: bool,
+    pub cert_provider_name: String,
 }
 
 pub struct OwnedCert {
@@ -32,6 +36,11 @@ pub struct OwnedCert {
     pub context: *const CERT_CONTEXT,
     pub valid_now: bool,
     pub supports_digital_signature: bool,
+    pub key_provider_name: String,
+    pub key_container_name: String,
+    pub key_provider_type: u32,
+    pub key_spec: u32,
+    pub is_hardware_token: bool,
 }
 
 unsafe impl Send for OwnedCert {}
@@ -100,6 +109,9 @@ pub fn sign_single_pdf_bytes(
         signed_pdf,
         cert_subject: cert.subject.clone(),
         cert_issuer: cert.issuer.clone(),
+        cert_thumbprint: cert.thumbprint.clone(),
+        cert_is_hardware_token: cert.is_hardware_token,
+        cert_provider_name: cert.key_provider_name.clone(),
     })
 }
 
@@ -284,7 +296,10 @@ fn choose_certificate_index(
 ) -> Result<usize> {
     if let Some(index) = cert_override.index {
         if (1..=certs.len()).contains(&index) {
-            return Ok(index - 1);
+            let selected = index - 1;
+            ensure_mode_allows_certificate(&certs[selected], &cert_override.mode)?;
+            log_certificate_selection(certs, selected, "config.index");
+            return Ok(selected);
         }
         bail!(
             "cert_override.index invalido: {}. Valores aceitos: 1..={}",
@@ -301,6 +316,8 @@ fn choose_certificate_index(
                 .enumerate()
                 .find(|(_, cert)| cert.thumbprint == wanted)
             {
+                ensure_mode_allows_certificate(&certs[idx], &cert_override.mode)?;
+                log_certificate_selection(certs, idx, "config.thumbprint");
                 return Ok(idx);
             }
             eprintln!(
@@ -313,7 +330,10 @@ fn choose_certificate_index(
     if let Ok(raw) = env::var("ASSINADOR_CERT_INDEX") {
         let idx = raw.trim().parse::<usize>().unwrap_or(0);
         if (1..=certs.len()).contains(&idx) {
-            return Ok(idx - 1);
+            let selected = idx - 1;
+            ensure_mode_allows_certificate(&certs[selected], &cert_override.mode)?;
+            log_certificate_selection(certs, selected, "env.ASSINADOR_CERT_INDEX");
+            return Ok(selected);
         }
         bail!(
             "ASSINADOR_CERT_INDEX invalido: '{}'. Valores aceitos: 1..={}.",
@@ -323,35 +343,66 @@ fn choose_certificate_index(
     }
 
     if certs.len() == 1 {
+        ensure_mode_allows_certificate(&certs[0], &cert_override.mode)?;
+        log_certificate_selection(certs, 0, "auto.single");
         return Ok(0);
     }
 
-    let candidate_indexes: Vec<usize> = certs
+    let base_candidates: Vec<usize> = certs
         .iter()
         .enumerate()
         .filter_map(|(idx, cert)| (!is_test_certificate(cert)).then_some(idx))
         .collect();
-    let using_filtered_set = !candidate_indexes.is_empty();
+    let mut candidate_indexes = if base_candidates.is_empty() {
+        (0..certs.len()).collect::<Vec<usize>>()
+    } else {
+        base_candidates
+    };
 
-    let all_candidates: Vec<usize> = (0..certs.len()).collect();
-    let ranked = rank_certificates(
-        certs,
-        if using_filtered_set {
-            &candidate_indexes
-        } else {
-            &all_candidates
-        },
-    );
+    let hardware_candidates: Vec<usize> = candidate_indexes
+        .iter()
+        .copied()
+        .filter(|idx| certs[*idx].is_hardware_token)
+        .collect();
+
+    match cert_override.mode.as_str() {
+        "token_only" => {
+            if hardware_candidates.is_empty() {
+                bail!(
+                    "cert_override.mode=token_only exige certificado de token/smart card, \
+                     mas nenhum foi encontrado no repositorio 'Minhas'."
+                );
+            }
+            candidate_indexes = hardware_candidates;
+        }
+        "auto" => {
+            if !hardware_candidates.is_empty() {
+                candidate_indexes = hardware_candidates;
+            }
+        }
+        _ => {
+            bail!(
+                "cert_override.mode invalido: '{}'. Valores aceitos: auto, token_only",
+                cert_override.mode
+            );
+        }
+    }
+
+    let ranked = rank_certificates(certs, &candidate_indexes);
     let best_idx = ranked[0].index;
+
+    log_certificate_selection(certs, best_idx, "auto");
 
     if verbose {
         println!("[AUTO][verbose] Motivos por certificado:");
         for entry in &ranked {
             println!(
-                "  [{}] score={} {}",
+                "  [{}] score={} {} | token_hardware={} | provider='{}'",
                 entry.index + 1,
                 entry.score,
-                certs[entry.index].subject
+                certs[entry.index].subject,
+                certs[entry.index].is_hardware_token,
+                certs[entry.index].key_provider_name
             );
             for reason in &entry.reasons {
                 println!("       - {reason}");
@@ -387,6 +438,8 @@ fn rank_certificates(certs: &[OwnedCert], candidate_indexes: &[usize]) -> Vec<Ra
 fn certificate_score(cert: &OwnedCert) -> (i32, Vec<String>) {
     let subject_lc = cert.subject.to_ascii_lowercase();
     let issuer_lc = cert.issuer.to_ascii_lowercase();
+    let provider_lc = cert.key_provider_name.to_ascii_lowercase();
+    let container_lc = cert.key_container_name.to_ascii_lowercase();
 
     let mut score = 0;
     let mut reasons = Vec::new();
@@ -411,6 +464,49 @@ fn certificate_score(cert: &OwnedCert) -> (i32, Vec<String>) {
     } else {
         score -= 220;
         reasons.push("-220 key usage sem assinatura digital".to_string());
+    }
+    if cert.is_hardware_token {
+        score += 900;
+        reasons.push("+900 certificado detectado como token/smart card".to_string());
+    } else {
+        score -= 380;
+        reasons.push("-380 nao parece certificado de token/smart card".to_string());
+    }
+    if contains_any(
+        &provider_lc,
+        &["software key storage provider", "software cryptographic provider"],
+    ) {
+        score -= 500;
+        reasons.push("-500 provider de software (sem token)".to_string());
+    }
+    if contains_any(
+        &provider_lc,
+        &[
+            "smart card",
+            "token",
+            "safenet",
+            "watchdata",
+            "entersafe",
+            "epass",
+        ],
+    ) {
+        score += 280;
+        reasons.push("+280 provider indica token/smart card".to_string());
+    }
+    if contains_any(
+        &container_lc,
+        &[
+            "smart",
+            "token",
+            "safenet",
+            "watchdata",
+            "etoken",
+            "entersafe",
+            "epass",
+        ],
+    ) {
+        score += 130;
+        reasons.push("+130 container indica token/smart card".to_string());
     }
     if looks_like_guid(&cert.subject) {
         score -= 120;
@@ -482,6 +578,33 @@ fn is_test_certificate(cert: &OwnedCert) -> bool {
         || issuer_lc.contains("localhost")
 }
 
+fn ensure_mode_allows_certificate(cert: &OwnedCert, mode: &str) -> Result<()> {
+    if mode == "token_only" && !cert.is_hardware_token {
+        bail!(
+            "cert_override.mode=token_only exige certificado de token/smart card. \
+             O certificado selecionado nao parece hardware token."
+        );
+    }
+    Ok(())
+}
+
+fn log_certificate_selection(certs: &[OwnedCert], selected_idx: usize, source: &str) {
+    let cert = &certs[selected_idx];
+    logger::info(format!(
+        "Certificado selecionado ({source}): idx={}/{}; subject='{}'; issuer='{}'; thumbprint={}; token_hardware={}; provider='{}'; container='{}'; key_spec={}; prov_type={}",
+        selected_idx + 1,
+        certs.len(),
+        cert.subject,
+        cert.issuer,
+        cert.thumbprint,
+        cert.is_hardware_token,
+        cert.key_provider_name,
+        cert.key_container_name,
+        cert.key_spec,
+        cert.key_provider_type
+    ));
+}
+
 fn show_summary(pdfs: &[PathBuf], report: &SignReport) {
     let mut resumo = format!(
         "Assinados com sucesso: {}/{}\n",
@@ -545,6 +668,11 @@ fn list_my_certificates() -> Result<Vec<OwnedCert>> {
             let thumbprint = cert_thumbprint_sha1(ctx)?;
             let valid_now = cert_is_valid_now(ctx);
             let supports_digital_signature = cert_supports_digital_signature(ctx);
+            let key_info = cert_key_provider_info(ctx).unwrap_or_default();
+            let is_hardware_token = looks_like_hardware_token(
+                &key_info.provider_name,
+                &key_info.container_name,
+            );
 
             let owned_ctx = CertDuplicateCertificateContext(Some(ctx as *const CERT_CONTEXT));
             if owned_ctx.is_null() {
@@ -558,6 +686,11 @@ fn list_my_certificates() -> Result<Vec<OwnedCert>> {
                 context: owned_ctx,
                 valid_now,
                 supports_digital_signature,
+                key_provider_name: key_info.provider_name,
+                key_container_name: key_info.container_name,
+                key_provider_type: key_info.provider_type,
+                key_spec: key_info.key_spec,
+                is_hardware_token,
             });
         }
 
@@ -570,6 +703,46 @@ fn cert_has_private_key(ctx: *const CERT_CONTEXT) -> bool {
     unsafe {
         let mut size = 0u32;
         CertGetCertificateContextProperty(ctx, CERT_KEY_PROV_INFO_PROP_ID, None, &mut size).is_ok()
+    }
+}
+
+#[derive(Default)]
+struct CertKeyProviderInfo {
+    provider_name: String,
+    container_name: String,
+    provider_type: u32,
+    key_spec: u32,
+}
+
+fn cert_key_provider_info(ctx: *const CERT_CONTEXT) -> Result<CertKeyProviderInfo> {
+    unsafe {
+        let mut size = 0u32;
+        CertGetCertificateContextProperty(ctx, CERT_KEY_PROV_INFO_PROP_ID, None, &mut size)
+            .context("Falha ao consultar tamanho de CERT_KEY_PROV_INFO")?;
+
+        if size == 0 {
+            return Ok(CertKeyProviderInfo::default());
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        CertGetCertificateContextProperty(
+            ctx,
+            CERT_KEY_PROV_INFO_PROP_ID,
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut size,
+        )
+        .context("Falha ao ler CERT_KEY_PROV_INFO")?;
+
+        let info = &*(buffer.as_ptr() as *const CRYPT_KEY_PROV_INFO);
+        let provider_name = wide_ptr_to_string(info.pwszProvName.0);
+        let container_name = wide_ptr_to_string(info.pwszContainerName.0);
+
+        Ok(CertKeyProviderInfo {
+            provider_name,
+            container_name,
+            provider_type: info.dwProvType,
+            key_spec: info.dwKeySpec,
+        })
     }
 }
 
@@ -611,6 +784,53 @@ fn cert_thumbprint_sha1(ctx: *const CERT_CONTEXT) -> Result<String> {
         buffer.truncate(size as usize);
         Ok(buffer.iter().map(|b| format!("{b:02X}")).collect())
     }
+}
+
+fn looks_like_hardware_token(provider_name: &str, container_name: &str) -> bool {
+    let provider_lc = provider_name.to_ascii_lowercase();
+    let container_lc = container_name.to_ascii_lowercase();
+    let combined = format!("{provider_lc} {container_lc}");
+
+    if contains_any(
+        &combined,
+        &[
+            "smart card",
+            "smartcard",
+            "token",
+            "etoken",
+            "safenet",
+            "watchdata",
+            "aladdin",
+            "gemalto",
+            "entersafe",
+            "epass",
+            "pkcs11",
+            "pkcs#11",
+            "a3",
+        ],
+    ) {
+        return true;
+    }
+
+    false
+}
+
+unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+
+    if len == 0 {
+        return String::new();
+    }
+
+    let slice = slice::from_raw_parts(ptr, len);
+    String::from_utf16_lossy(slice)
 }
 
 unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String {

@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Assinador Livre WS Playground</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --line: #d3d9e3;
+      --text: #1b2430;
+      --muted: #5b6573;
+      --accent: #0b5ed7;
+      --ok: #198754;
+      --err: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top right, #dde8ff, var(--bg) 40%);
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      color: var(--text);
+    }
+    .container {
+      max-width: 1280px;
+      margin: 28px auto;
+      padding: 0 16px;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(520px, 1fr) minmax(420px, 0.95fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .left-col, .right-col {
+      display: grid;
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px;
+      box-shadow: 0 8px 20px rgba(18, 33, 58, 0.06);
+    }
+    h1 { margin: 0 0 8px; font-size: 1.35rem; }
+    .subtitle { margin: 0; color: var(--muted); font-size: 0.92rem; }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    @media (max-width: 820px) {
+      .layout { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+    label {
+      display: block;
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    input[type="text"], input[type="file"] {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 9px 10px;
+      background: #fff;
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      border: 1px solid #0a58ca;
+      background: var(--accent);
+      color: white;
+      border-radius: 8px;
+      padding: 9px 12px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: #fff;
+      color: #0a58ca;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .status {
+      margin-top: 8px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }
+    .status.ok { color: var(--ok); }
+    .status.err { color: var(--err); }
+    .log {
+      font-family: Consolas, Monaco, monospace;
+      font-size: 0.82rem;
+      background: #0d1117;
+      color: #d0d7de;
+      border-radius: 8px;
+      padding: 10px;
+      min-height: 230px;
+      max-height: 460px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .pdf-wrap {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      background: #f9fbff;
+      height: 78vh;
+      min-height: 420px;
+    }
+    .pdf-viewer {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+    .pdf-empty {
+      display: grid;
+      place-content: center;
+      height: 100%;
+      color: var(--muted);
+      font-size: 0.95rem;
+      text-align: center;
+      padding: 16px;
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <div class="layout">
+      <div class="left-col">
+        <section class="card">
+          <h1>Assinador Livre - WebSocket Playground</h1>
+          <p class="subtitle">Teste auth, ping e assinatura de PDF no endpoint local do app.</p>
+          <div class="row">
+            <div>
+              <label for="wsUrl">WebSocket URL</label>
+              <input id="wsUrl" type="text" />
+            </div>
+            <div>
+              <label for="token">Token (dev)</label>
+              <input id="token" type="text" value="troque-este-token" />
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btnConnect">Conectar</button>
+            <button id="btnDisconnect" class="secondary" disabled>Desconectar</button>
+            <button id="btnPing" disabled>Ping</button>
+          </div>
+          <p id="status" class="status">Desconectado</p>
+        </section>
+
+        <section class="card">
+          <h1>Assinar PDF</h1>
+          <div class="row">
+            <div>
+              <label for="filePdf">Arquivo PDF</label>
+              <input id="filePdf" type="file" accept="application/pdf" />
+            </div>
+          </div>
+          <div class="actions">
+            <button id="btnSign" disabled>Assinar PDF</button>
+          </div>
+          <p class="subtitle">Resposta com `signed_pdf_base64` atualiza o viewer do PDF assinado.</p>
+        </section>
+
+        <section class="card">
+          <h1>Log JSON</h1>
+          <div id="log" class="log"></div>
+        </section>
+      </div>
+
+      <div class="right-col">
+        <section class="card">
+          <h1>PDF Assinado</h1>
+          <p class="subtitle">Visualizacao do resultado da ultima assinatura.</p>
+          <div class="actions">
+            <button id="btnDownload" class="secondary" disabled>Baixar PDF assinado</button>
+          </div>
+          <div class="pdf-wrap">
+            <div id="pdfEmpty" class="pdf-empty">Nenhum PDF assinado recebido ainda.</div>
+            <object id="pdfViewer" class="pdf-viewer" type="application/pdf" data="" style="display:none;"></object>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    const wsUrlInput = document.getElementById("wsUrl");
+    const tokenInput = document.getElementById("token");
+    const filePdfInput = document.getElementById("filePdf");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const pdfViewer = document.getElementById("pdfViewer");
+    const pdfEmpty = document.getElementById("pdfEmpty");
+
+    const btnConnect = document.getElementById("btnConnect");
+    const btnDisconnect = document.getElementById("btnDisconnect");
+    const btnPing = document.getElementById("btnPing");
+    const btnSign = document.getElementById("btnSign");
+    const btnDownload = document.getElementById("btnDownload");
+
+    const defaultWs = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+    wsUrlInput.value = defaultWs;
+
+    let ws = null;
+    let counter = 1;
+    let pendingSignReqId = null;
+    let signedPdfBlobUrl = null;
+    let isAuthenticated = false;
+
+    function nextId() {
+      const id = String(counter);
+      counter += 1;
+      return id;
+    }
+
+    function setStatus(text, tone) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (tone ? ` ${tone}` : "");
+    }
+
+    function appendLog(direction, payload) {
+      const ts = new Date().toISOString();
+      const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+      logEl.textContent += `[${ts}] ${direction}\n${body}\n\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function updateButtons() {
+      const connected = ws && ws.readyState === WebSocket.OPEN;
+      btnConnect.disabled = connected;
+      btnDisconnect.disabled = !connected;
+      btnPing.disabled = !connected || !isAuthenticated;
+      btnSign.disabled = !connected || !isAuthenticated;
+    }
+
+    function sendJson(obj) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        appendLog("LOCAL", "Socket nao conectado");
+        return false;
+      }
+      ws.send(JSON.stringify(obj));
+      appendLog("OUT", obj);
+      return true;
+    }
+
+    function decodeBase64ToBytes(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function triggerDownload(fileUrl, fileName) {
+      const a = document.createElement("a");
+      a.href = fileUrl;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    btnConnect.addEventListener("click", () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        return;
+      }
+      const url = wsUrlInput.value.trim();
+      try {
+        ws = new WebSocket(url);
+      } catch (err) {
+        setStatus(`Falha ao criar socket: ${err}`, "err");
+        appendLog("LOCAL", String(err));
+        return;
+      }
+
+      ws.onopen = () => {
+        isAuthenticated = false;
+        setStatus(`Conectado em ${url}. Autenticando...`, "ok");
+        appendLog("LOCAL", `Socket aberto para ${url}. Enviando auth automaticamente.`);
+        updateButtons();
+
+        const token = tokenInput.value.trim();
+        const id = nextId();
+        sendJson({
+          id,
+          action: "auth",
+          payload: { token }
+        });
+      };
+
+      ws.onclose = (evt) => {
+        isAuthenticated = false;
+        setStatus(`Desconectado (code=${evt.code})`, "");
+        appendLog("LOCAL", `Socket fechado (code=${evt.code}, reason=${evt.reason || ""})`);
+        updateButtons();
+      };
+
+      ws.onerror = () => {
+        setStatus("Erro no socket", "err");
+        appendLog("LOCAL", "Erro no socket");
+      };
+
+      ws.onmessage = (evt) => {
+        let parsed = null;
+        try {
+          parsed = JSON.parse(evt.data);
+        } catch (_) {
+          appendLog("IN", evt.data);
+          return;
+        }
+
+        appendLog("IN", parsed);
+
+        if (
+          parsed &&
+          parsed.ok === true &&
+          parsed.result &&
+          parsed.result.status === "authenticated"
+        ) {
+          isAuthenticated = true;
+          setStatus("Autenticado com sucesso.", "ok");
+          updateButtons();
+        }
+
+        if (
+          pendingSignReqId &&
+          parsed &&
+          parsed.id === pendingSignReqId &&
+          parsed.ok === true &&
+          parsed.result &&
+          typeof parsed.result.signed_pdf_base64 === "string"
+        ) {
+          try {
+            const bytes = decodeBase64ToBytes(parsed.result.signed_pdf_base64);
+            if (signedPdfBlobUrl) {
+              URL.revokeObjectURL(signedPdfBlobUrl);
+            }
+            const blob = new Blob([bytes], { type: "application/pdf" });
+            signedPdfBlobUrl = URL.createObjectURL(blob);
+            pdfViewer.data = signedPdfBlobUrl;
+            pdfViewer.style.display = "block";
+            pdfEmpty.style.display = "none";
+            btnDownload.disabled = false;
+            const certSubject =
+              parsed.result && typeof parsed.result.cert_subject === "string"
+                ? parsed.result.cert_subject
+                : "(sem subject)";
+            const certProvider =
+              parsed.result && typeof parsed.result.cert_provider_name === "string"
+                ? parsed.result.cert_provider_name
+                : "(sem provider)";
+            const isHw = !!(parsed.result && parsed.result.cert_is_hardware_token);
+            setStatus(
+              `PDF assinado recebido com certificado: ${certSubject} | provider: ${certProvider} | token/hardware: ${isHw ? "sim" : "nao"}.`,
+              isHw ? "ok" : ""
+            );
+          } catch (err) {
+            setStatus(`Falha ao processar PDF assinado: ${err}`, "err");
+            appendLog("LOCAL", String(err));
+          } finally {
+            pendingSignReqId = null;
+          }
+        }
+      };
+
+      updateButtons();
+    });
+
+    btnDisconnect.addEventListener("click", () => {
+      if (ws) {
+        ws.close();
+      }
+    });
+
+    btnPing.addEventListener("click", () => {
+      const id = nextId();
+      sendJson({ id, action: "ping", payload: {} });
+    });
+
+    btnSign.addEventListener("click", async () => {
+      const file = filePdfInput.files && filePdfInput.files[0];
+      if (!file) {
+        setStatus("Selecione um PDF antes de assinar.", "err");
+        return;
+      }
+
+      const id = nextId();
+      pendingSignReqId = id;
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+
+      let binary = "";
+      for (let i = 0; i < bytes.length; i += 1) {
+        binary += String.fromCharCode(bytes[i]);
+      }
+      const base64 = btoa(binary);
+
+      sendJson({
+        id,
+        action: "sign_pdf",
+        payload: {
+          filename: file.name,
+          pdf_base64: base64
+        }
+      });
+      setStatus("Pedido de assinatura enviado.", "");
+    });
+
+    btnDownload.addEventListener("click", () => {
+      if (!signedPdfBlobUrl) {
+        return;
+      }
+      triggerDownload(signedPdfBlobUrl, "documento_assinado.pdf");
+    });
+
+    updateButtons();
+  </script>
+</body>
+</html>

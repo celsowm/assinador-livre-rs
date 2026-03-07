@@ -161,9 +161,9 @@ fn normalize_and_validate(config: &mut AppConfig) -> Result<()> {
     if config.cert_override.mode.is_empty() {
         config.cert_override.mode = "auto".to_string();
     }
-    if config.cert_override.mode != "auto" {
+    if config.cert_override.mode != "auto" && config.cert_override.mode != "token_only" {
         bail!(
-            "cert_override.mode invalido: '{}'. Valor aceito: auto",
+            "cert_override.mode invalido: '{}'. Valores aceitos: auto, token_only",
             config.cert_override.mode
         );
     }
@@ -194,5 +194,12 @@ mod tests {
         let mut cfg = AppConfig::default();
         cfg.ws_token = "   ".to_string();
         assert!(normalize_and_validate(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn accepts_token_only_mode() {
+        let mut cfg = AppConfig::default();
+        cfg.cert_override.mode = "token_only".to_string();
+        assert!(normalize_and_validate(&mut cfg).is_ok());
     }
 }
