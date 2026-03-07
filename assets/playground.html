@@ -112,6 +112,35 @@
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .tab-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin-bottom: 8px;
+      min-height: 0;
+    }
+    .tab-bar:empty { display: none; }
+    .tab-btn {
+      border: 1px solid var(--line);
+      background: #f0f2f5;
+      color: var(--text);
+      border-radius: 6px 6px 0 0;
+      padding: 6px 12px;
+      font-size: 0.82rem;
+      font-weight: 500;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .tab-btn.active {
+      background: var(--panel);
+      border-bottom-color: var(--panel);
+      font-weight: 700;
+    }
+    .tab-btn .tab-icon { font-size: 0.9rem; }
+    .tab-btn .tab-icon.ok { color: var(--ok); }
+    .tab-btn .tab-icon.err { color: var(--err); }
     .pdf-wrap {
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -131,6 +160,15 @@
       place-content: center;
       height: 100%;
       color: var(--muted);
+      font-size: 0.95rem;
+      text-align: center;
+      padding: 16px;
+    }
+    .pdf-error-msg {
+      display: grid;
+      place-content: center;
+      height: 100%;
+      color: var(--err);
       font-size: 0.95rem;
       text-align: center;
       padding: 16px;
@@ -166,8 +204,8 @@
           <h1>Assinar PDF</h1>
           <div class="row">
             <div>
-              <label for="filePdf">Arquivo PDF</label>
-              <input id="filePdf" type="file" accept="application/pdf" />
+              <label for="filePdf">Arquivo(s) PDF</label>
+              <input id="filePdf" type="file" accept="application/pdf" multiple />
             </div>
             <div>
               <label for="visiblePlacement">Assinatura visivel</label>
@@ -186,8 +224,9 @@
           </div>
           <div class="actions">
             <button id="btnSign" disabled>Assinar PDF</button>
+            <button id="btnSignBatch" disabled>Assinar PDFs (lote)</button>
           </div>
-          <p class="subtitle">Resposta com `signed_pdf_base64` atualiza o viewer do PDF assinado.</p>
+          <p class="subtitle">Selecione um PDF para <em>sign_pdf</em> ou varios para <em>sign_pdfs</em> (lote).</p>
         </section>
 
         <section class="card">
@@ -200,11 +239,14 @@
         <section class="card">
           <h1>PDF Assinado</h1>
           <p class="subtitle">Visualizacao do resultado da ultima assinatura.</p>
+          <div id="tabBar" class="tab-bar"></div>
           <div class="actions">
             <button id="btnDownload" class="secondary" disabled>Baixar PDF assinado</button>
+            <button id="btnDownloadAll" class="secondary" disabled style="display:none">Baixar todos</button>
           </div>
           <div class="pdf-wrap">
             <div id="pdfEmpty" class="pdf-empty">Nenhum PDF assinado recebido ainda.</div>
+            <div id="pdfErrorMsg" class="pdf-error-msg" style="display:none"></div>
             <object id="pdfViewer" class="pdf-viewer" type="application/pdf" data="" style="display:none;"></object>
           </div>
         </section>
@@ -221,12 +263,16 @@
     const logEl = document.getElementById("log");
     const pdfViewer = document.getElementById("pdfViewer");
     const pdfEmpty = document.getElementById("pdfEmpty");
+    const pdfErrorMsg = document.getElementById("pdfErrorMsg");
+    const tabBar = document.getElementById("tabBar");
 
     const btnConnect = document.getElementById("btnConnect");
     const btnDisconnect = document.getElementById("btnDisconnect");
     const btnPing = document.getElementById("btnPing");
     const btnSign = document.getElementById("btnSign");
+    const btnSignBatch = document.getElementById("btnSignBatch");
     const btnDownload = document.getElementById("btnDownload");
+    const btnDownloadAll = document.getElementById("btnDownloadAll");
 
     const defaultWs = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
     wsUrlInput.value = defaultWs;
@@ -234,8 +280,12 @@
     let ws = null;
     let counter = 1;
     let pendingSignReqId = null;
-    let signedPdfBlobUrl = null;
+    let pendingBatchReqId = null;
     let isAuthenticated = false;
+
+    // Tab state
+    let signedTabs = [];       // [{filename, ok, blobUrl, error}]
+    let activeTabIndex = -1;
 
     function nextId() {
       const id = String(counter);
@@ -250,18 +300,46 @@
 
     function appendLog(direction, payload) {
       const ts = new Date().toISOString();
-      const body = typeof payload === "string" ? payload : JSON.stringify(payload, null, 2);
+      let body;
+      if (typeof payload === "string") {
+        body = payload;
+      } else {
+        const sanitized = sanitizeLogPayload(payload);
+        body = JSON.stringify(sanitized, null, 2);
+      }
       logEl.textContent += `[${ts}] ${direction}\n${body}\n\n`;
       logEl.scrollTop = logEl.scrollHeight;
     }
 
+    function sanitizeLogPayload(obj) {
+      if (!obj || typeof obj !== "object") return obj;
+      const clone = Array.isArray(obj) ? [] : {};
+      for (const key in obj) {
+        if (key === "pdf_base64" || key === "signed_pdf_base64") {
+          const val = obj[key];
+          clone[key] = typeof val === "string" ? `<${val.length} chars>` : val;
+        } else if (key === "files" && Array.isArray(obj[key])) {
+          clone[key] = obj[key].map(f => sanitizeLogPayload(f));
+        } else if (key === "result" && typeof obj[key] === "object") {
+          clone[key] = sanitizeLogPayload(obj[key]);
+        } else {
+          clone[key] = obj[key];
+        }
+      }
+      return clone;
+    }
+
     function updateButtons() {
       const connected = ws && ws.readyState === WebSocket.OPEN;
+      const fileCount = filePdfInput.files ? filePdfInput.files.length : 0;
       btnConnect.disabled = connected;
       btnDisconnect.disabled = !connected;
       btnPing.disabled = !connected || !isAuthenticated;
-      btnSign.disabled = !connected || !isAuthenticated;
+      btnSign.disabled = !connected || !isAuthenticated || fileCount !== 1;
+      btnSignBatch.disabled = !connected || !isAuthenticated || fileCount < 1;
     }
+
+    filePdfInput.addEventListener("change", updateButtons);
 
     function sendJson(obj) {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -290,6 +368,96 @@
       a.click();
       a.remove();
     }
+
+    function fileToBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const bytes = new Uint8Array(reader.result);
+          let binary = "";
+          for (let i = 0; i < bytes.length; i += 1) {
+            binary += String.fromCharCode(bytes[i]);
+          }
+          resolve(btoa(binary));
+        };
+        reader.onerror = reject;
+        reader.readAsArrayBuffer(file);
+      });
+    }
+
+    // ── Tab management ──
+
+    function clearTabs() {
+      for (const tab of signedTabs) {
+        if (tab.blobUrl) URL.revokeObjectURL(tab.blobUrl);
+      }
+      signedTabs = [];
+      activeTabIndex = -1;
+      renderTabs();
+    }
+
+    function setSignedTabs(tabs) {
+      clearTabs();
+      signedTabs = tabs;
+      activeTabIndex = tabs.length > 0 ? 0 : -1;
+      renderTabs();
+      showTab(activeTabIndex);
+    }
+
+    function renderTabs() {
+      tabBar.innerHTML = "";
+      if (signedTabs.length <= 1 && signedTabs.length > 0) {
+        // single file — no tab bar needed, just show it
+        showTab(0);
+        return;
+      }
+      signedTabs.forEach((tab, idx) => {
+        const btn = document.createElement("button");
+        btn.className = "tab-btn" + (idx === activeTabIndex ? " active" : "");
+        const icon = document.createElement("span");
+        icon.className = "tab-icon " + (tab.ok ? "ok" : "err");
+        icon.textContent = tab.ok ? "✓" : "✗";
+        btn.appendChild(icon);
+        btn.appendChild(document.createTextNode(tab.filename || `PDF ${idx + 1}`));
+        btn.addEventListener("click", () => {
+          activeTabIndex = idx;
+          renderTabs();
+          showTab(idx);
+        });
+        tabBar.appendChild(btn);
+      });
+    }
+
+    function showTab(idx) {
+      if (idx < 0 || idx >= signedTabs.length) {
+        pdfViewer.style.display = "none";
+        pdfErrorMsg.style.display = "none";
+        pdfEmpty.style.display = "";
+        btnDownload.disabled = true;
+        return;
+      }
+      const tab = signedTabs[idx];
+      pdfEmpty.style.display = "none";
+      if (tab.ok && tab.blobUrl) {
+        pdfViewer.data = tab.blobUrl;
+        pdfViewer.style.display = "block";
+        pdfErrorMsg.style.display = "none";
+        btnDownload.disabled = false;
+      } else {
+        pdfViewer.style.display = "none";
+        pdfErrorMsg.textContent = "Erro ao assinar: " + (tab.error || "desconhecido");
+        pdfErrorMsg.style.display = "";
+        btnDownload.disabled = true;
+      }
+    }
+
+    function updateDownloadAllButton() {
+      const hasMultipleOk = signedTabs.filter(t => t.ok).length > 1;
+      btnDownloadAll.style.display = hasMultipleOk ? "" : "none";
+      btnDownloadAll.disabled = !hasMultipleOk;
+    }
+
+    // ── WebSocket ──
 
     btnConnect.addEventListener("click", () => {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -342,6 +510,7 @@
 
         appendLog("IN", parsed);
 
+        // auth response
         if (
           parsed &&
           parsed.ok === true &&
@@ -353,49 +522,81 @@
           updateButtons();
         }
 
+        // single sign_pdf response
         if (
           pendingSignReqId &&
           parsed &&
-          parsed.id === pendingSignReqId &&
-          parsed.ok === true &&
-          parsed.result &&
-          typeof parsed.result.signed_pdf_base64 === "string"
+          parsed.id === pendingSignReqId
         ) {
-          try {
-            const bytes = decodeBase64ToBytes(parsed.result.signed_pdf_base64);
-            if (signedPdfBlobUrl) {
-              URL.revokeObjectURL(signedPdfBlobUrl);
+          pendingSignReqId = null;
+          if (parsed.ok === true && parsed.result && typeof parsed.result.signed_pdf_base64 === "string") {
+            try {
+              const bytes = decodeBase64ToBytes(parsed.result.signed_pdf_base64);
+              const blob = new Blob([bytes], { type: "application/pdf" });
+              const blobUrl = URL.createObjectURL(blob);
+              const filename = filePdfInput.files && filePdfInput.files[0]
+                ? filePdfInput.files[0].name.replace(/\.pdf$/i, "_assinado.pdf")
+                : "documento_assinado.pdf";
+              setSignedTabs([{ filename, ok: true, blobUrl, error: null }]);
+              updateDownloadAllButton();
+              showCertStatus(parsed.result);
+            } catch (err) {
+              setStatus(`Falha ao processar PDF assinado: ${err}`, "err");
             }
-            const blob = new Blob([bytes], { type: "application/pdf" });
-            signedPdfBlobUrl = URL.createObjectURL(blob);
-            pdfViewer.data = signedPdfBlobUrl;
-            pdfViewer.style.display = "block";
-            pdfEmpty.style.display = "none";
-            btnDownload.disabled = false;
-            const certSubject =
-              parsed.result && typeof parsed.result.cert_subject === "string"
-                ? parsed.result.cert_subject
-                : "(sem subject)";
-            const certProvider =
-              parsed.result && typeof parsed.result.cert_provider_name === "string"
-                ? parsed.result.cert_provider_name
-                : "(sem provider)";
-            const isHw = !!(parsed.result && parsed.result.cert_is_hardware_token);
-            setStatus(
-              `PDF assinado recebido com certificado: ${certSubject} | provider: ${certProvider} | token/hardware: ${isHw ? "sim" : "nao"}.`,
-              isHw ? "ok" : ""
-            );
-          } catch (err) {
-            setStatus(`Falha ao processar PDF assinado: ${err}`, "err");
-            appendLog("LOCAL", String(err));
-          } finally {
-            pendingSignReqId = null;
+          } else if (parsed.ok === false) {
+            setStatus(`Erro: ${parsed.error ? parsed.error.message : "desconhecido"}`, "err");
+          }
+        }
+
+        // batch sign_pdfs response
+        if (
+          pendingBatchReqId &&
+          parsed &&
+          parsed.id === pendingBatchReqId
+        ) {
+          pendingBatchReqId = null;
+          if (parsed.ok === true && parsed.result && Array.isArray(parsed.result.files)) {
+            try {
+              const tabs = parsed.result.files.map(f => {
+                if (f.ok && typeof f.signed_pdf_base64 === "string") {
+                  const bytes = decodeBase64ToBytes(f.signed_pdf_base64);
+                  const blob = new Blob([bytes], { type: "application/pdf" });
+                  const blobUrl = URL.createObjectURL(blob);
+                  const outName = (f.filename || "documento").replace(/\.pdf$/i, "_assinado.pdf");
+                  return { filename: outName, ok: true, blobUrl, error: null };
+                } else {
+                  return { filename: f.filename || "?", ok: false, blobUrl: null, error: f.error || "desconhecido" };
+                }
+              });
+              setSignedTabs(tabs);
+              updateDownloadAllButton();
+              const okCount = tabs.filter(t => t.ok).length;
+              const errCount = tabs.filter(t => !t.ok).length;
+              let msg = `Lote concluido: ${okCount} sucesso(s)`;
+              if (errCount > 0) msg += `, ${errCount} erro(s)`;
+              showCertStatus(parsed.result, msg);
+            } catch (err) {
+              setStatus(`Falha ao processar lote assinado: ${err}`, "err");
+            }
+          } else if (parsed.ok === false) {
+            setStatus(`Erro no lote: ${parsed.error ? parsed.error.message : "desconhecido"}`, "err");
           }
         }
       };
 
       updateButtons();
     });
+
+    function showCertStatus(result, prefix) {
+      const certSubject = typeof result.cert_subject === "string" ? result.cert_subject : "(sem subject)";
+      const certProvider = typeof result.cert_provider_name === "string" ? result.cert_provider_name : "(sem provider)";
+      const isHw = !!result.cert_is_hardware_token;
+      const base = prefix || "PDF assinado recebido";
+      setStatus(
+        `${base} | certificado: ${certSubject} | provider: ${certProvider} | token/hardware: ${isHw ? "sim" : "nao"}.`,
+        isHw ? "ok" : ""
+      );
+    }
 
     btnDisconnect.addEventListener("click", () => {
       if (ws) {
@@ -408,6 +609,7 @@
       sendJson({ id, action: "ping", payload: {} });
     });
 
+    // Single sign_pdf
     btnSign.addEventListener("click", async () => {
       const file = filePdfInput.files && filePdfInput.files[0];
       if (!file) {
@@ -417,14 +619,7 @@
 
       const id = nextId();
       pendingSignReqId = id;
-      const buf = await file.arrayBuffer();
-      const bytes = new Uint8Array(buf);
-
-      let binary = "";
-      for (let i = 0; i < bytes.length; i += 1) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      const base64 = btoa(binary);
+      const base64 = await fileToBase64(file);
 
       const payload = {
         filename: file.name,
@@ -443,11 +638,52 @@
       setStatus("Pedido de assinatura enviado.", "");
     });
 
-    btnDownload.addEventListener("click", () => {
-      if (!signedPdfBlobUrl) {
+    // Batch sign_pdfs
+    btnSignBatch.addEventListener("click", async () => {
+      const fileList = filePdfInput.files;
+      if (!fileList || fileList.length === 0) {
+        setStatus("Selecione ao menos um PDF.", "err");
         return;
       }
-      triggerDownload(signedPdfBlobUrl, "documento_assinado.pdf");
+
+      const id = nextId();
+      pendingBatchReqId = id;
+      const placement = visiblePlacementInput.value;
+
+      const files = [];
+      for (let i = 0; i < fileList.length; i += 1) {
+        const base64 = await fileToBase64(fileList[i]);
+        const entry = {
+          filename: fileList[i].name,
+          pdf_base64: base64
+        };
+        if (placement) {
+          entry.visible_signature = { placement };
+        }
+        files.push(entry);
+      }
+
+      sendJson({
+        id,
+        action: "sign_pdfs",
+        payload: { files }
+      });
+      setStatus(`Pedido de assinatura em lote enviado (${files.length} arquivo(s)).`, "");
+    });
+
+    btnDownload.addEventListener("click", () => {
+      if (activeTabIndex < 0 || activeTabIndex >= signedTabs.length) return;
+      const tab = signedTabs[activeTabIndex];
+      if (!tab.blobUrl) return;
+      triggerDownload(tab.blobUrl, tab.filename || "documento_assinado.pdf");
+    });
+
+    btnDownloadAll.addEventListener("click", () => {
+      for (const tab of signedTabs) {
+        if (tab.ok && tab.blobUrl) {
+          triggerDownload(tab.blobUrl, tab.filename || "documento_assinado.pdf");
+        }
+      }
     });
 
     updateButtons();

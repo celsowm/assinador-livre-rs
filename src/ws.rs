@@ -337,6 +337,26 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
                     send_error(&mut sink, req.id, "SIGNING_FAILED", &msg).await?;
                 }
             },
+            "sign_pdfs" => match handle_sign_pdfs(req.payload, state.clone()).await {
+                Ok(result) => {
+                    send_ok(&mut sink, req.id, result).await?;
+                }
+                Err(WsActionError::Busy) => {
+                    send_error(
+                        &mut sink,
+                        req.id,
+                        "BUSY",
+                        "Ja existe assinatura em andamento",
+                    )
+                    .await?;
+                }
+                Err(WsActionError::Invalid(msg)) => {
+                    send_error(&mut sink, req.id, "INVALID_REQUEST", &msg).await?;
+                }
+                Err(WsActionError::Signing(msg)) => {
+                    send_error(&mut sink, req.id, "SIGNING_FAILED", &msg).await?;
+                }
+            },
             _ => {
                 send_error(&mut sink, req.id, "INVALID_REQUEST", "Action nao suportada").await?;
             }
@@ -405,6 +425,123 @@ async fn handle_sign_pdf(
         )),
         Err(_) => Err(WsActionError::Signing("Timeout na assinatura".to_string())),
     }
+}
+
+async fn handle_sign_pdfs(
+    payload: Value,
+    state: Arc<SharedState>,
+) -> std::result::Result<Value, WsActionError> {
+    let payload: SignPdfsPayload = serde_json::from_value(payload)
+        .map_err(|_| WsActionError::Invalid("Payload sign_pdfs invalido".to_string()))?;
+
+    if payload.files.is_empty() {
+        return Err(WsActionError::Invalid("Lista de arquivos vazia".to_string()));
+    }
+
+    let mut inputs = Vec::with_capacity(payload.files.len());
+    for entry in &payload.files {
+        if entry.pdf_base64.len() > MAX_BASE64_SIZE {
+            return Err(WsActionError::Invalid(format!(
+                "pdf_base64 do arquivo '{}' excede limite de {} bytes",
+                entry.filename.as_deref().unwrap_or("?"),
+                MAX_BASE64_SIZE
+            )));
+        }
+
+        let pdf_bytes = STANDARD
+            .decode(entry.pdf_base64.as_bytes())
+            .map_err(|_| {
+                WsActionError::Invalid(format!(
+                    "pdf_base64 invalido no arquivo '{}'",
+                    entry.filename.as_deref().unwrap_or("?")
+                ))
+            })?;
+
+        inputs.push(signer::BatchFileInput {
+            filename: entry.filename.clone().unwrap_or_default(),
+            pdf_bytes,
+            visible_signature: entry.visible_signature.clone(),
+        });
+    }
+
+    let permit = state
+        .signing_gate
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| WsActionError::Busy)?;
+
+    logger::info(format!(
+        "Assinatura em lote iniciada via WebSocket ({} arquivo(s))",
+        inputs.len()
+    ));
+
+    let cert_override = state.config.cert_override.clone();
+    let verbose = state.verbose;
+    let started = Instant::now();
+
+    let signing_task = tokio::task::spawn_blocking(move || {
+        signer::sign_batch_pdf_bytes(inputs, &cert_override, verbose)
+    });
+    let (result_tx, result_rx) =
+        oneshot::channel::<std::result::Result<signer::BatchSignResult, WsActionError>>();
+
+    tokio::spawn(async move {
+        let outcome = signing_task
+            .await
+            .map_err(|err| WsActionError::Signing(format!("Task de assinatura falhou: {err:#}")))
+            .and_then(|res| res.map_err(|err| WsActionError::Signing(format!("{err:#}"))));
+        let _ = result_tx.send(outcome);
+        drop(permit);
+    });
+
+    let batch_result = match timeout(Duration::from_secs(SIGN_TIMEOUT_SECS), result_rx).await {
+        Ok(Ok(result)) => {
+            logger::info(format!(
+                "Assinatura em lote WS concluida em {} ms",
+                started.elapsed().as_millis()
+            ));
+            result?
+        }
+        Ok(Err(_)) => {
+            return Err(WsActionError::Signing(
+                "Falha ao receber retorno da assinatura em lote".to_string(),
+            ));
+        }
+        Err(_) => {
+            return Err(WsActionError::Signing(
+                "Timeout na assinatura em lote".to_string(),
+            ));
+        }
+    };
+
+    let files_json: Vec<Value> = batch_result
+        .files
+        .into_iter()
+        .map(|f| {
+            if f.ok {
+                json!({
+                    "filename": f.filename,
+                    "ok": true,
+                    "signed_pdf_base64": STANDARD.encode(f.signed_pdf.unwrap_or_default()),
+                })
+            } else {
+                json!({
+                    "filename": f.filename,
+                    "ok": false,
+                    "error": f.error.unwrap_or_default(),
+                })
+            }
+        })
+        .collect();
+
+    Ok(json!({
+        "files": files_json,
+        "cert_subject": batch_result.cert_subject,
+        "cert_issuer": batch_result.cert_issuer,
+        "cert_thumbprint": batch_result.cert_thumbprint,
+        "cert_is_hardware_token": batch_result.cert_is_hardware_token,
+        "cert_provider_name": batch_result.cert_provider_name,
+    }))
 }
 
 fn parse_request_message(message: Message) -> Result<ClientRequest> {
@@ -534,6 +671,18 @@ struct AuthPayload {
 #[derive(Debug, Deserialize)]
 struct SignPdfPayload {
     #[allow(dead_code)]
+    filename: Option<String>,
+    pdf_base64: String,
+    visible_signature: Option<signer::VisibleSignatureRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignPdfsPayload {
+    files: Vec<SignPdfFileEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignPdfFileEntry {
     filename: Option<String>,
     pdf_base64: String,
     visible_signature: Option<signer::VisibleSignatureRequest>,

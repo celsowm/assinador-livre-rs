@@ -146,6 +146,75 @@ pub fn sign_single_pdf_bytes(
     })
 }
 
+pub struct BatchFileInput {
+    pub filename: String,
+    pub pdf_bytes: Vec<u8>,
+    pub visible_signature: Option<VisibleSignatureRequest>,
+}
+
+pub struct BatchFileResult {
+    pub filename: String,
+    pub ok: bool,
+    pub signed_pdf: Option<Vec<u8>>,
+    pub error: Option<String>,
+}
+
+pub struct BatchSignResult {
+    pub files: Vec<BatchFileResult>,
+    pub cert_subject: String,
+    pub cert_issuer: String,
+    pub cert_thumbprint: String,
+    pub cert_is_hardware_token: bool,
+    pub cert_provider_name: String,
+}
+
+pub fn sign_batch_pdf_bytes(
+    inputs: Vec<BatchFileInput>,
+    cert_override: &CertOverride,
+    verbose: bool,
+) -> Result<BatchSignResult> {
+    let certs = load_available_certificates()?;
+    let cert_idx = choose_certificate_index(&certs, cert_override, verbose)?;
+    let cert = &certs[cert_idx];
+
+    let mut file_results = Vec::with_capacity(inputs.len());
+
+    for input in &inputs {
+        let visible_signature = input.visible_signature.as_ref().map(|cfg| VisibleSignatureAppearance {
+            placement: cfg.placement,
+            signer_name: cert.subject.clone(),
+        });
+
+        match sign_pdf_bytes(&input.pdf_bytes, cert.context, visible_signature.as_ref()) {
+            Ok(signed_pdf) => {
+                file_results.push(BatchFileResult {
+                    filename: input.filename.clone(),
+                    ok: true,
+                    signed_pdf: Some(signed_pdf),
+                    error: None,
+                });
+            }
+            Err(e) => {
+                file_results.push(BatchFileResult {
+                    filename: input.filename.clone(),
+                    ok: false,
+                    signed_pdf: None,
+                    error: Some(format!("{e:#}")),
+                });
+            }
+        }
+    }
+
+    Ok(BatchSignResult {
+        files: file_results,
+        cert_subject: cert.subject.clone(),
+        cert_issuer: cert.issuer.clone(),
+        cert_thumbprint: cert.thumbprint.clone(),
+        cert_is_hardware_token: cert.is_hardware_token,
+        cert_provider_name: cert.key_provider_name.clone(),
+    })
+}
+
 pub fn sign_pdf_file(input: &Path, output: &Path, cert_ctx: *const CERT_CONTEXT) -> Result<()> {
     let original = fs::read(input)?;
     let signed = sign_pdf_bytes(&original, cert_ctx, None)

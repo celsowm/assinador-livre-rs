@@ -113,6 +113,7 @@ http://127.0.0.1:45890/playground
 1. `auth`
 2. `ping`
 3. `sign_pdf`
+4. `sign_pdfs` (assinatura em lote)
 
 ### Formato de requisicao
 
@@ -160,6 +161,48 @@ Observacoes:
 - `visible_signature` e opcional.
 - Quando ausente, a assinatura continua invisivel (comportamento legado).
 - Quando presente, a assinatura visivel e aplicada apenas na primeira pagina.
+
+#### Assinatura em lote (`sign_pdfs`)
+
+```json
+{
+  "id":"4",
+  "action":"sign_pdfs",
+  "payload":{
+    "files":[
+      {"filename":"doc1.pdf","pdf_base64":"...","visible_signature":{"placement":"top_left_horizontal"}},
+      {"filename":"doc2.pdf","pdf_base64":"..."}
+    ]
+  }
+}
+```
+
+Resposta (sucesso):
+
+```json
+{
+  "id":"4",
+  "ok":true,
+  "result":{
+    "files":[
+      {"filename":"doc1.pdf","ok":true,"signed_pdf_base64":"..."},
+      {"filename":"doc2.pdf","ok":false,"error":"mensagem de erro"}
+    ],
+    "cert_subject":"...",
+    "cert_issuer":"...",
+    "cert_thumbprint":"...",
+    "cert_is_hardware_token":true,
+    "cert_provider_name":"..."
+  }
+}
+```
+
+Observacoes:
+
+- O certificado e carregado uma unica vez para todo o lote.
+- Cada arquivo reporta sucesso/falha individualmente.
+- O limite de `pdf_base64` (20 MB) e aplicado por arquivo.
+- O semaforo de assinatura e adquirido uma vez para o lote inteiro.
 
 ### Formato de resposta (sucesso)
 
