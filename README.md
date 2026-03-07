@@ -24,9 +24,9 @@ Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via 
 
 ## Instalacao para usuario final (MSI)
 
-Baixe o instalador em:
+Baixe o instalador na pagina de Releases (versao mais recente):
 
-- `https://github.com/<owner>/<repo>/releases/latest`
+- [Releases do Assinador Livre](https://github.com/celsowm/assinador-livre/releases/latest)
 
 Arquivo esperado em cada release:
 
