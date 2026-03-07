@@ -1,0 +1,195 @@
+# Assinador Livre (Windows)
+
+Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via Windows Certificate Store.
+
+## O que este app faz
+
+- Roda residente na bandeja do Windows.
+- Menu com:
+  - `Assinar documento`
+  - `Sair`
+- Assina PDFs com certificado do repositorio `MY` (Minhas) do Windows.
+- Expoe WebSocket local para uma aplicacao web detectar o app e solicitar assinatura.
+- Cria configuracao em `%APPDATA%\\AssinadorLivre\\config.json`.
+- Registra auto-start no login do Windows (HKCU Run) quando habilitado.
+- Gera logs em `%APPDATA%\\AssinadorLivre\\logs\\assinador.log` com rotacao simples por tamanho.
+
+## Requisitos
+
+- Windows
+- Rust toolchain (para desenvolvimento)
+- Middleware/driver do token A3 instalado
+- Certificado com chave privada disponivel no repositorio `MY`
+
+## Build
+
+```powershell
+cargo build --release
+```
+
+Binario esperado:
+
+```text
+target\\release\\assinador-livre.exe
+```
+
+## Modos de execucao (CLI)
+
+```powershell
+# Modo bandeja (default)
+assinador-livre.exe
+
+# Fluxo imediato de assinatura (abre seletor de PDF e encerra)
+assinador-livre.exe --sign-now
+
+# Mostra caminho do config
+assinador-livre.exe --print-config-path
+
+# Logs mais verbosos
+assinador-livre.exe --verbose
+```
+
+## Configuracao
+
+Na primeira execucao, o app cria:
+
+```text
+%APPDATA%\\AssinadorLivre\\config.json
+```
+
+Exemplo:
+
+```json
+{
+  "ws_host": "127.0.0.1",
+  "ws_port": 45890,
+  "ws_path": "/ws",
+  "ws_token": "troque-este-token",
+  "allowed_origins": [
+    "http://localhost:3000",
+    "https://seu-dominio.com"
+  ],
+  "cert_override": {
+    "mode": "auto",
+    "thumbprint": null,
+    "index": null
+  },
+  "startup_with_windows": true
+}
+```
+
+### Regras de certificado (`cert_override`)
+
+- `mode=auto`: usa ranking automatico.
+- `thumbprint` preenchido: tenta certificado especifico; se nao encontrar, cai para auto.
+- `index` preenchido: forca indice (1-based) da lista de certificados.
+
+## WebSocket local
+
+Endpoint padrao:
+
+```text
+ws://127.0.0.1:45890/ws
+```
+
+### Regras de seguranca
+
+- Bind apenas em localhost (`ws_host`).
+- `Origin` deve estar em `allowed_origins`.
+- Primeira mensagem obrigatoriamente `auth` em ate 3 segundos.
+- Token deve bater com `ws_token`.
+
+### Acoes suportadas
+
+1. `auth`
+2. `ping`
+3. `sign_pdf`
+
+### Formato de requisicao
+
+```json
+{"id":"1","action":"auth","payload":{"token":"..."}}
+```
+
+```json
+{"id":"2","action":"ping","payload":{}}
+```
+
+```json
+{"id":"3","action":"sign_pdf","payload":{"filename":"doc.pdf","pdf_base64":"..."}}
+```
+
+### Formato de resposta (sucesso)
+
+```json
+{"id":"3","ok":true,"result":{"signed_pdf_base64":"...","cert_subject":"...","cert_issuer":"..."}}
+```
+
+### Formato de resposta (erro)
+
+```json
+{"id":"3","ok":false,"error":{"code":"SIGNING_FAILED","message":"..."}}
+```
+
+### Codigos de erro
+
+- `AUTH_REQUIRED`
+- `AUTH_FAILED`
+- `ORIGIN_NOT_ALLOWED`
+- `INVALID_REQUEST`
+- `SIGNING_FAILED`
+- `BUSY`
+
+### Limites operacionais
+
+- `pdf_base64`: max 20 MB.
+- Timeout de autenticacao: 3s.
+- Timeout de assinatura: 120s.
+
+## Fluxo de bandeja
+
+1. Inicie o app sem argumentos.
+2. Clique direito no icone da bandeja.
+3. Clique em `Assinar documento`.
+4. Selecione um ou mais PDFs.
+5. Arquivos assinados sao gravados como `*_assinado.pdf` no mesmo diretorio.
+
+## Auto-start no Windows
+
+Quando `startup_with_windows=true`, o app garante entrada em:
+
+```text
+HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run
+```
+
+Valor:
+
+```text
+AssinadorLivre = "<caminho-do-exe>"
+```
+
+## Desenvolvimento
+
+```powershell
+cargo fmt
+cargo check
+cargo test
+```
+
+## Troubleshooting rapido
+
+- Nao encontrou certificado:
+  - confira token conectado
+  - confira middleware instalado
+  - confira certificado no repositorio `MY` com chave privada
+- Web app nao conecta:
+  - valide `allowed_origins`
+  - valide `ws_token`
+  - valide host/porta/path (`ws_host`, `ws_port`, `ws_path`)
+- Assinatura retornando `BUSY`:
+  - ja existe assinatura em andamento (bandeja ou websocket)
+
+## Observacoes
+
+- O app usa o dialogo seguro do Windows/token para PIN quando necessario.
+- O protocolo e local (localhost), sem TLS por padrao.
