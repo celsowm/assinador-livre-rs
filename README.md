@@ -22,6 +22,25 @@ Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via 
 - Middleware/driver do token A3 instalado
 - Certificado com chave privada disponivel no repositorio `MY`
 
+## Instalacao para usuario final (MSI)
+
+Baixe o instalador em:
+
+- `https://github.com/<owner>/<repo>/releases/latest`
+
+Arquivo esperado em cada release:
+
+- `assinador-livre-<versao>-x64.msi`
+
+Fluxo recomendado:
+
+1. Execute o `.msi`.
+2. Escolha o escopo de instalacao:
+   - por usuario (sem admin), ou
+   - por maquina (pode exigir admin).
+3. Finalize a instalacao e mantenha marcada a opcao para abrir o app ao concluir.
+4. No primeiro inicio, o app cria/valida configuracao e auto-start.
+
 ## Build
 
 ```powershell
@@ -32,6 +51,19 @@ Binario esperado:
 
 ```text
 target\\release\\assinador-livre.exe
+```
+
+## Build do instalador MSI (desenvolvimento)
+
+```powershell
+cargo install cargo-wix --locked
+cargo wix --target x86_64-pc-windows-msvc
+```
+
+Saida esperada:
+
+```text
+target\\wix\\*.msi
 ```
 
 ## Modos de execucao (CLI)
@@ -267,6 +299,23 @@ Valor:
 ```text
 AssinadorLivre = "<caminho-do-exe>"
 ```
+
+No instalador MSI, a chave de auto-start tambem e criada no `HKCU Run` durante a instalacao.
+Assim, o comportamento fica redundante por seguranca:
+
+- o MSI grava a entrada para o usuario instalador;
+- o proprio app revalida/atualiza a entrada ao iniciar.
+
+## Release automatico no GitHub
+
+O workflow `.github/workflows/release-msi.yml` publica release estavel ao receber `push` na `main`.
+
+Contrato operacional:
+
+- cada novo release exige bump em `version` no `Cargo.toml`;
+- se a versao atual ja existir no ultimo release estavel, o workflow falha;
+- o release e publicado com tag `v<versao>`;
+- o asset publicado segue o padrao `assinador-livre-<versao>-x64.msi`.
 
 ## Desenvolvimento
 

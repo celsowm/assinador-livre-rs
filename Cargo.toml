@@ -1,6 +1,6 @@
 [package]
 name = "assinador-livre"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.93"
 description = "Aplicacao desktop para assinatura digital de PDF com certificado A3 no Windows"
@@ -33,3 +33,13 @@ windows-sys = { version = "0.48", features = ["Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 winres = "0.1"
+
+[package.metadata.wix]
+product-name = "Assinador Livre"
+manufacturer = "Assinador Livre"
+description = "Aplicacao desktop para assinatura digital de PDF com certificado A3 no Windows"
+upgrade-guid = "1B5C11A4-51D6-4D63-8CE3-8F2A4EAA2A87"
+path-guid = "A9B27FD0-02DA-4F4F-9A1D-C3B8D80F0A1C"
+license = false
+eula = false
+source = "wix/main.wxs"

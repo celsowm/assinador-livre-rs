@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product
+    Id="*"
+    Name="$(var.ProductName)"
+    Language="1046"
+    Version="$(var.Version)"
+    Manufacturer="$(var.Manufacturer)"
+    UpgradeCode="1B5C11A4-51D6-4D63-8CE3-8F2A4EAA2A87">
+    <Package
+      Description="$(var.Description)"
+      Manufacturer="$(var.Manufacturer)"
+      InstallerVersion="500"
+      Compressed="yes"
+      InstallScope="perMachine"
+      InstallPrivileges="elevated" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ALLUSERS" Value="2" Secure="yes" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" Secure="yes" />
+    <Property Id="WixAppFolder" Value="WixPerUserFolder" />
+    <Property Id="WixUISupportPerUser" Value="1" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Iniciar Assinador Livre agora" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#AssinadorLivreExe]" />
+
+    <MajorUpgrade
+      DowngradeErrorMessage="Ja existe uma versao mais recente do [ProductName] instalada." />
+
+    <Feature Id="MainFeature" Title="$(var.ProductName)" Level="1">
+      <ComponentRef Id="MainExecutableComponent" />
+      <ComponentRef Id="RunAtStartupComponent" />
+      <ComponentRef Id="ApplicationShortcutComponent" />
+      <ComponentRef Id="AppIconComponent" />
+    </Feature>
+
+    <UIRef Id="WixUI_Advanced" />
+    <UIRef Id="WixUI_ErrorProgressText" />
+
+    <CustomAction
+      Id="LaunchApplication"
+      BinaryKey="WixCA"
+      DllEntry="WixShellExec"
+      Impersonate="yes" />
+
+    <Publish
+      Dialog="ExitDialog"
+      Control="Finish"
+      Event="DoAction"
+      Value="LaunchApplication">WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed</Publish>
+  </Product>
+
+  <Fragment>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="WixPerMachineFolder" Name="Assinador Livre">
+          <Directory Id="INSTALLDIR" Name="Assinador Livre" />
+        </Directory>
+      </Directory>
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="WixPerUserFolder" Name="Assinador Livre" />
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Directory Id="ApplicationProgramsFolder" Name="Assinador Livre" />
+      </Directory>
+    </Directory>
+  </Fragment>
+
+  <Fragment>
+    <Icon Id="AppIcon.ico" SourceFile="$(var.SourceDir)\assets\icone-assinador-livre.ico" />
+
+    <Component Id="MainExecutableComponent" Directory="INSTALLDIR" Guid="6D6BC45E-B8E5-47D6-8E62-2D3C2C3C1E13">
+      <File
+        Id="AssinadorLivreExe"
+        Source="$(var.CargoTargetBinDir)\assinador-livre.exe"
+        KeyPath="yes" />
+    </Component>
+
+    <Component Id="RunAtStartupComponent" Directory="INSTALLDIR" Guid="F8D8B872-9B17-4DCC-83D3-9C2187F0BC2C">
+      <RegistryKey Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run">
+        <RegistryValue
+          Name="AssinadorLivre"
+          Type="string"
+          Value="&quot;[#AssinadorLivreExe]&quot;"
+          KeyPath="yes" />
+      </RegistryKey>
+    </Component>
+
+    <Component Id="ApplicationShortcutComponent" Directory="ApplicationProgramsFolder" Guid="BB5099C7-D2D9-4A8D-9697-B11F83DFDC6B">
+      <Shortcut
+        Id="ApplicationStartMenuShortcut"
+        Name="Assinador Livre"
+        Description="$(var.Description)"
+        Target="[#AssinadorLivreExe]"
+        WorkingDirectory="INSTALLDIR" />
+      <RemoveFolder Id="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\AssinadorLivre" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="AppIconComponent" Directory="INSTALLDIR" Guid="42B7D46D-F989-4516-8137-5C2636C93DC2">
+      <File Id="AppIconFile" Source="$(var.SourceDir)\assets\icone-assinador-livre.ico" KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

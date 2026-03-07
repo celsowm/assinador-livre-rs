@@ -1,0 +1,122 @@
+name: Release MSI
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release-msi:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read app version from Cargo.toml
+        id: app_version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($version)) {
+            Write-Error "Nao foi possivel extrair a versao do Cargo.toml"
+            exit 1
+          }
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Validate version bump against latest stable release
+        uses: actions/github-script@v7
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const appVersion = process.env.APP_VERSION;
+            const releases = await github.paginate(github.rest.repos.listReleases, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+
+            const stable = releases
+              .filter(r => !r.draft && !r.prerelease)
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+            if (stable.length === 0) {
+              core.info("Nenhum release estavel anterior encontrado. Prosseguindo.");
+              return;
+            }
+
+            const latestTag = stable[0].tag_name || "";
+            const latestVersion = latestTag.replace(/^v/, "");
+            core.info(`Ultimo release estavel: ${latestTag}`);
+            core.info(`Versao atual do app: ${appVersion}`);
+
+            if (latestVersion === appVersion) {
+              core.setFailed(
+                `Versao ${appVersion} ja foi publicada. Faca bump em Cargo.toml antes de publicar novo release.`
+              );
+            }
+
+      - name: Fail if tag already exists
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.app_version.outputs.tag }}
+        run: |
+          git fetch --tags --force
+          $tag = $env:RELEASE_TAG
+          $existing = git tag -l $tag
+          if (-not [string]::IsNullOrWhiteSpace($existing)) {
+            Write-Error "Tag $tag ja existe. Atualize a versao no Cargo.toml para gerar novo release."
+            exit 1
+          }
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install cargo-wix
+        shell: pwsh
+        run: cargo install cargo-wix --locked
+
+      - name: Build release binary
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build MSI
+        shell: pwsh
+        run: cargo wix --no-build --target x86_64-pc-windows-msvc
+
+      - name: Rename MSI artifact
+        id: artifact
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.app_version.outputs.version }}
+        run: |
+          $msi = Get-ChildItem -Path target\wix -Filter *.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msi) {
+            Write-Error "Nenhum arquivo MSI foi gerado em target\\wix"
+            exit 1
+          }
+          $assetName = "assinador-livre-$env:APP_VERSION-x64.msi"
+          $assetPath = Join-Path $msi.DirectoryName $assetName
+          Copy-Item $msi.FullName $assetPath -Force
+          "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.app_version.outputs.tag }}
+          name: ${{ steps.app_version.outputs.tag }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: ${{ steps.artifact.outputs.asset_path }}
