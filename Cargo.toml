@@ -3,6 +3,8 @@ name = "assinador-livre"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
+description = "Aplicacao desktop para assinatura digital de PDF com certificado A3 no Windows"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"
