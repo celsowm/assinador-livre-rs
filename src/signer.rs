@@ -1,6 +1,6 @@
 use crate::{config::CertOverride, logger};
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use lopdf::{Document, Object, ObjectId};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 use serde::Deserialize;
@@ -41,17 +41,57 @@ pub enum VisibleSignaturePlacement {
     BottomLeftVertical,
     BottomRightHorizontal,
     BottomRightVertical,
+    BottomCenterHorizontal,
+    BottomCenterVertical,
+    CenterHorizontal,
+    CenterVertical,
+}
+
+impl VisibleSignaturePlacement {
+    fn is_vertical(self) -> bool {
+        matches!(
+            self,
+            Self::TopLeftVertical
+                | Self::TopRightVertical
+                | Self::BottomLeftVertical
+                | Self::BottomRightVertical
+                | Self::BottomCenterVertical
+                | Self::CenterVertical
+        )
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisibleSignatureRequest {
     pub placement: VisibleSignaturePlacement,
+    #[serde(default)]
+    pub style: VisibleSignatureStyle,
+    #[serde(default)]
+    pub timezone: VisibleSignatureTimezone,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibleSignatureStyle {
+    #[default]
+    Default,
+    Compact,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VisibleSignatureTimezone {
+    Utc,
+    #[default]
+    Local,
 }
 
 #[derive(Debug, Clone)]
 pub struct VisibleSignatureAppearance {
     pub placement: VisibleSignaturePlacement,
     pub signer_name: String,
+    pub style: VisibleSignatureStyle,
+    pub timezone: VisibleSignatureTimezone,
 }
 
 pub struct OwnedCert {
@@ -132,6 +172,8 @@ pub fn sign_single_pdf_bytes(
     let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
         placement: cfg.placement,
         signer_name: cert.subject.clone(),
+        style: cfg.style,
+        timezone: cfg.timezone,
     });
 
     let signed_pdf = sign_pdf_bytes(input, cert.context, visible_signature.as_ref())?;
@@ -183,6 +225,8 @@ pub fn sign_batch_pdf_bytes(
         let visible_signature = input.visible_signature.as_ref().map(|cfg| VisibleSignatureAppearance {
             placement: cfg.placement,
             signer_name: cert.subject.clone(),
+            style: cfg.style,
+            timezone: cfg.timezone,
         });
 
         match sign_pdf_bytes(&input.pdf_bytes, cert.context, visible_signature.as_ref()) {
@@ -339,8 +383,11 @@ pub fn sign_pdf_bytes(
 
     if let (Some(ap_num), Some(font_num), Some(visible_cfg)) = (ap_num, font_num, visible_signature)
     {
-        let appearance =
-            build_visible_signature_appearance(widget_rect, &visible_cfg.signer_name, signed_at);
+        let appearance = build_visible_signature_appearance(
+            widget_rect,
+            visible_cfg,
+            signed_at,
+        );
         xref_entries.push(XrefEntry::new(ap_num, 0, original.len() + upd.len()));
         write!(upd, "{ap_num} 0 obj\n<<\n")?;
         write!(upd, "/Type /XObject\n/Subtype /Form\n")?;
@@ -571,11 +618,15 @@ fn compute_visible_signature_rect(
         VisibleSignaturePlacement::TopLeftHorizontal
         | VisibleSignaturePlacement::TopRightHorizontal
         | VisibleSignaturePlacement::BottomLeftHorizontal
-        | VisibleSignaturePlacement::BottomRightHorizontal => (H_WIDTH, H_HEIGHT),
+        | VisibleSignaturePlacement::BottomRightHorizontal
+        | VisibleSignaturePlacement::BottomCenterHorizontal
+        | VisibleSignaturePlacement::CenterHorizontal => (H_WIDTH, H_HEIGHT),
         VisibleSignaturePlacement::TopLeftVertical
         | VisibleSignaturePlacement::TopRightVertical
         | VisibleSignaturePlacement::BottomLeftVertical
-        | VisibleSignaturePlacement::BottomRightVertical => (V_WIDTH, V_HEIGHT),
+        | VisibleSignaturePlacement::BottomRightVertical
+        | VisibleSignaturePlacement::BottomCenterVertical
+        | VisibleSignaturePlacement::CenterVertical => (V_WIDTH, V_HEIGHT),
     };
 
     let llx = media_box[0];
@@ -597,6 +648,12 @@ fn compute_visible_signature_rect(
         | VisibleSignaturePlacement::TopRightVertical
         | VisibleSignaturePlacement::BottomRightHorizontal
         | VisibleSignaturePlacement::BottomRightVertical => urx - MARGIN - width,
+        VisibleSignaturePlacement::BottomCenterHorizontal
+        | VisibleSignaturePlacement::BottomCenterVertical
+        | VisibleSignaturePlacement::CenterHorizontal
+        | VisibleSignaturePlacement::CenterVertical => {
+            llx + (urx - llx - width) / 2.0
+        }
     };
 
     let y = match placement {
@@ -608,6 +665,11 @@ fn compute_visible_signature_rect(
         | VisibleSignaturePlacement::BottomLeftVertical
         | VisibleSignaturePlacement::BottomRightHorizontal
         | VisibleSignaturePlacement::BottomRightVertical => lly + MARGIN,
+        VisibleSignaturePlacement::BottomCenterHorizontal
+        | VisibleSignaturePlacement::BottomCenterVertical => lly + MARGIN,
+        VisibleSignaturePlacement::CenterHorizontal | VisibleSignaturePlacement::CenterVertical => {
+            lly + (ury - lly - height) / 2.0
+        }
     };
 
     [x, y, x + width, y + height]
@@ -615,30 +677,218 @@ fn compute_visible_signature_rect(
 
 fn build_visible_signature_appearance(
     rect: [f32; 4],
-    signer_name: &str,
+    cfg: &VisibleSignatureAppearance,
     signed_at: DateTime<Utc>,
 ) -> Vec<u8> {
     let width = rect[2] - rect[0];
     let height = rect[3] - rect[1];
-    let line1 = escape_pdf_literal("Assinado digitalmente");
-    let line2 = escape_pdf_literal(&truncate_text(
-        &format!("Assinante: {}", signer_name.trim()),
-        80,
-    ));
-    let line3 = escape_pdf_literal(&format!(
-        "Data/Hora: {}",
-        signed_at.format("%d/%m/%Y %H:%M:%S UTC")
-    ));
-    let baseline = (height - 18.0).max(20.0);
 
-    format!(
-        "q\n1 1 0.93 rg\n0 0 {width:.2} {height:.2} re\nf\n0 0 0 RG\n1 w\n0 0 {width:.2} {height:.2} re\nS\nBT\n/F1 11 Tf\n0 0 0 rg\n8 {baseline:.2} Td\n({line1}) Tj\n0 -15 Td\n({line2}) Tj\n0 -15 Td\n({line3}) Tj\nET\nQ\n"
-    )
-    .into_bytes()
+    let local_dt = format_visible_signature_datetime(signed_at, cfg.timezone);
+    let preset = appearance_preset(cfg.style);
+    let text_width = if cfg.placement.is_vertical() {
+        height
+    } else {
+        width
+    };
+    let text_height = if cfg.placement.is_vertical() { width } else { height };
+
+    let mut text_lines = Vec::new();
+    let mut selected_font_size = preset.min_font_size;
+    let mut selected_line_height = preset.min_font_size + preset.line_spacing;
+
+    let mut font_size = preset.base_font_size;
+    while font_size >= preset.min_font_size {
+        let line_height = font_size + preset.line_spacing;
+        let max_chars = max_chars_per_line(text_width, preset.padding, font_size);
+        let signer_lines = wrap_text_with_ellipsis(
+            &format!("Assinante: {}", cfg.signer_name.trim()),
+            max_chars,
+            2,
+        );
+        let date_line = truncate_with_ellipsis(
+            &format!("Data/Hora: {}", local_dt),
+            max_chars,
+        );
+        let lines = vec![
+            "Assinado digitalmente".to_string(),
+            signer_lines.first().cloned().unwrap_or_default(),
+            if signer_lines.len() > 1 {
+                signer_lines[1].clone()
+            } else {
+                date_line.clone()
+            },
+            if signer_lines.len() > 1 {
+                date_line.clone()
+            } else {
+                String::new()
+            },
+        ]
+        .into_iter()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<String>>();
+
+        let needed_height = preset.padding * 2.0 + (lines.len() as f32 * line_height);
+        if needed_height <= text_height - 2.0 {
+            text_lines = lines;
+            selected_font_size = font_size;
+            selected_line_height = line_height;
+            break;
+        }
+
+        font_size -= 0.5;
+    }
+
+    if text_lines.is_empty() {
+        let max_chars = max_chars_per_line(text_width, preset.padding, preset.min_font_size);
+        text_lines.push("Assinado digitalmente".to_string());
+        text_lines.push(truncate_with_ellipsis(
+            &format!("Assinante: {}", cfg.signer_name.trim()),
+            max_chars,
+        ));
+        text_lines.push(truncate_with_ellipsis(
+            &format!("Data/Hora: {}", local_dt),
+            max_chars,
+        ));
+    }
+
+    let start_y = (text_height - preset.padding - selected_font_size).max(preset.padding);
+    let mut text_ops = String::new();
+    text_ops.push_str("BT\n");
+    text_ops.push_str(&format!("/F1 {:.1} Tf\n", selected_font_size));
+    text_ops.push_str("0.08 0.08 0.08 rg\n");
+    text_ops.push_str(&format!("{:.2} {:.2} Td\n", preset.padding, start_y));
+
+    for (idx, line) in text_lines.iter().enumerate() {
+        if idx > 0 {
+            text_ops.push_str(&format!("0 -{:.2} Td\n", selected_line_height));
+        }
+        text_ops.push_str(&format!("({}) Tj\n", escape_pdf_literal(line)));
+    }
+    text_ops.push_str("ET\n");
+
+    let content = if cfg.placement.is_vertical() {
+        format!(
+            "q\n0.98 0.98 0.95 rg\n0 0 {width:.2} {height:.2} re\nf\n0.35 0.35 0.35 RG\n0.8 w\n0 0 {width:.2} {height:.2} re\nS\nq\n0 -1 1 0 0 {width:.2} cm\n{text_ops}Q\nQ\n"
+        )
+    } else {
+        format!(
+            "q\n0.98 0.98 0.95 rg\n0 0 {width:.2} {height:.2} re\nf\n0.35 0.35 0.35 RG\n0.8 w\n0 0 {width:.2} {height:.2} re\nS\n{text_ops}Q\n"
+        )
+    };
+
+    content.into_bytes()
 }
 
-fn truncate_text(input: &str, limit: usize) -> String {
-    input.chars().take(limit).collect()
+#[derive(Clone, Copy)]
+struct AppearancePreset {
+    padding: f32,
+    base_font_size: f32,
+    min_font_size: f32,
+    line_spacing: f32,
+}
+
+fn appearance_preset(style: VisibleSignatureStyle) -> AppearancePreset {
+    match style {
+        VisibleSignatureStyle::Default => AppearancePreset {
+            padding: 8.0,
+            base_font_size: 11.0,
+            min_font_size: 8.5,
+            line_spacing: 3.0,
+        },
+        VisibleSignatureStyle::Compact => AppearancePreset {
+            padding: 6.0,
+            base_font_size: 10.0,
+            min_font_size: 8.0,
+            line_spacing: 2.0,
+        },
+    }
+}
+
+fn format_visible_signature_datetime(
+    signed_at: DateTime<Utc>,
+    timezone: VisibleSignatureTimezone,
+) -> String {
+    match timezone {
+        VisibleSignatureTimezone::Utc => signed_at.format("%d/%m/%Y %H:%M:%S UTC").to_string(),
+        VisibleSignatureTimezone::Local => {
+            let local = signed_at.with_timezone(&Local);
+            format!("{} GMT{}", local.format("%d/%m/%Y %H:%M:%S"), local.format("%:z"))
+        }
+    }
+}
+
+fn max_chars_per_line(width: f32, padding: f32, font_size: f32) -> usize {
+    let available = (width - 2.0 * padding).max(24.0);
+    let avg_char_width = (font_size * 0.52).max(1.0);
+    (available / avg_char_width).floor() as usize
+}
+
+fn wrap_text_with_ellipsis(input: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
+    if max_chars == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+
+    for word in input.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if candidate.chars().count() <= max_chars {
+            current = candidate;
+            continue;
+        }
+
+        if current.is_empty() {
+            current = truncate_with_ellipsis(word, max_chars);
+        }
+
+        lines.push(current);
+        if lines.len() == max_lines {
+            return finalize_wrapped_lines(lines, max_chars);
+        }
+        current = word.to_string();
+        if current.chars().count() > max_chars {
+            current = truncate_with_ellipsis(&current, max_chars);
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+    }
+
+    finalize_wrapped_lines(lines, max_chars)
+}
+
+fn finalize_wrapped_lines(mut lines: Vec<String>, max_chars: usize) -> Vec<String> {
+    if lines.is_empty() {
+        return lines;
+    }
+    for line in &mut lines {
+        if line.chars().count() > max_chars {
+            *line = truncate_with_ellipsis(line, max_chars);
+        }
+    }
+    lines
+}
+
+fn truncate_with_ellipsis(input: &str, limit: usize) -> String {
+    if input.chars().count() <= limit {
+        return input.to_string();
+    }
+    if limit <= 3 {
+        return "...".chars().take(limit).collect();
+    }
+    let mut out = input.chars().take(limit - 3).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn escape_pdf_literal(input: &str) -> String {
@@ -1361,5 +1611,91 @@ mod tests {
             VisibleSignaturePlacement::BottomRightVertical,
         );
         assert_eq!(rect, [478.0, 24.0, 588.0, 204.0]);
+    }
+
+    #[test]
+    fn computes_center_horizontal_rect() {
+        let rect = compute_visible_signature_rect(
+            [0.0, 0.0, 612.0, 792.0],
+            VisibleSignaturePlacement::CenterHorizontal,
+        );
+        assert_eq!(rect, [196.0, 360.0, 416.0, 432.0]);
+    }
+
+    #[test]
+    fn computes_bottom_center_horizontal_rect() {
+        let rect = compute_visible_signature_rect(
+            [0.0, 0.0, 612.0, 792.0],
+            VisibleSignaturePlacement::BottomCenterHorizontal,
+        );
+        assert_eq!(rect, [196.0, 24.0, 416.0, 96.0]);
+    }
+
+    #[test]
+    fn vertical_appearance_rotates_text_clockwise() {
+        let appearance = String::from_utf8(build_visible_signature_appearance(
+            [0.0, 0.0, 110.0, 180.0],
+            &VisibleSignatureAppearance {
+                placement: VisibleSignaturePlacement::TopLeftVertical,
+                signer_name: "Teste".to_string(),
+                style: VisibleSignatureStyle::Default,
+                timezone: VisibleSignatureTimezone::Local,
+            },
+            DateTime::parse_from_rfc3339("2026-03-09T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ))
+        .unwrap();
+
+        assert!(appearance.contains("0 -1 1 0 0 110.00 cm"));
+    }
+
+    #[test]
+    fn horizontal_appearance_does_not_rotate_text() {
+        let appearance = String::from_utf8(build_visible_signature_appearance(
+            [0.0, 0.0, 220.0, 72.0],
+            &VisibleSignatureAppearance {
+                placement: VisibleSignaturePlacement::TopLeftHorizontal,
+                signer_name: "Teste".to_string(),
+                style: VisibleSignatureStyle::Default,
+                timezone: VisibleSignatureTimezone::Local,
+            },
+            DateTime::parse_from_rfc3339("2026-03-09T12:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        ))
+        .unwrap();
+
+        assert!(!appearance.contains("0 -1 1 0"));
+    }
+
+    #[test]
+    fn format_datetime_utc_keeps_suffix() {
+        let dt = DateTime::parse_from_rfc3339("2026-03-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = format_visible_signature_datetime(dt, VisibleSignatureTimezone::Utc);
+        assert!(text.ends_with(" UTC"));
+    }
+
+    #[test]
+    fn format_datetime_local_includes_gmt_offset() {
+        let dt = DateTime::parse_from_rfc3339("2026-03-09T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let text = format_visible_signature_datetime(dt, VisibleSignatureTimezone::Local);
+        assert!(text.contains(" GMT"));
+    }
+
+    #[test]
+    fn wraps_signer_line_with_ellipsis() {
+        let lines = wrap_text_with_ellipsis(
+            "Assinante: NOME MUITO GRANDE PARA TESTAR QUEBRA COM RETICENCIAS NO FIM",
+            24,
+            2,
+        );
+        assert!(!lines.is_empty());
+        assert!(lines.len() <= 2);
+        assert!(lines.iter().all(|line| line.chars().count() <= 24));
     }
 }

@@ -173,7 +173,9 @@ Com assinatura visivel opcional na primeira pagina:
     "filename":"doc.pdf",
     "pdf_base64":"...",
     "visible_signature":{
-      "placement":"top_left_horizontal"
+      "placement":"top_left_horizontal",
+      "style":"default",
+      "timezone":"local"
     }
   }
 }
@@ -189,10 +191,26 @@ Valores aceitos em `visible_signature.placement`:
 - `bottom_left_vertical`
 - `bottom_right_horizontal`
 - `bottom_right_vertical`
+- `bottom_center_horizontal`
+- `bottom_center_vertical`
+- `center_horizontal`
+- `center_vertical`
+
+Valores aceitos em `visible_signature.style` (opcional):
+
+- `default`
+- `compact`
+
+Valores aceitos em `visible_signature.timezone` (opcional):
+
+- `local` (padrao)
+- `utc`
 
 Observacoes:
 
 - `visible_signature` e opcional.
+- `style` e opcional e usa `default` quando ausente.
+- `timezone` e opcional e usa `local` quando ausente.
 - Quando ausente, a assinatura continua invisivel (comportamento legado).
 - Quando presente, a assinatura visivel e aplicada apenas na primeira pagina.
 

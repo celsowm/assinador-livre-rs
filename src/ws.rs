@@ -744,7 +744,9 @@ mod tests {
             "filename": "arquivo.pdf",
             "pdf_base64": "YWJj",
             "visible_signature": {
-                "placement": "top_left_horizontal"
+                "placement": "top_left_horizontal",
+                "style": "compact",
+                "timezone": "utc"
             }
         }));
         assert!(payload.is_ok());
@@ -766,6 +768,35 @@ mod tests {
             "pdf_base64": "YWJj",
             "visible_signature": {
                 "placement": "centro"
+            }
+        }));
+        assert!(payload.is_err());
+    }
+
+    #[test]
+    fn sign_pdf_payload_defaults_visible_signature_options() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "visible_signature": {
+                "placement": "top_left_horizontal"
+            }
+        }))
+        .unwrap();
+
+        let visible = payload.visible_signature.unwrap();
+        assert_eq!(visible.style, signer::VisibleSignatureStyle::Default);
+        assert_eq!(visible.timezone, signer::VisibleSignatureTimezone::Local);
+    }
+
+    #[test]
+    fn sign_pdf_payload_rejects_invalid_timezone() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "visible_signature": {
+                "placement": "top_left_horizontal",
+                "timezone": "america_sao_paulo"
             }
         }));
         assert!(payload.is_err());
