@@ -1,6 +1,10 @@
-# Assinador Livre (Windows)
+# Assinador Livre RS (Windows)
 
 Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via Windows Certificate Store.
+
+> **Migracao de nome:** o projeto foi renomeado de `assinador-livre` para `assinador-livre-rs` para evitar colisao de nome.
+>
+> **Atencao para GitHub Actions:** repositorios renomeados nao mantem redirecionamento para referencias `uses: owner/repo@ref`; consumidores precisam atualizar manualmente.
 
 ## O que este app faz
 
@@ -26,13 +30,13 @@ Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via 
 
 Baixe o instalador na pagina de Releases:
 
-- [Releases do Assinador Livre](https://github.com/celsowm/assinador-livre/releases)
+- [Releases do Assinador Livre RS](https://github.com/celsowm/assinador-livre-rs/releases)
 
 Se a pagina estiver vazia, ainda nao existe versao publicada para download.
 
 Arquivo esperado em cada release:
 
-- `assinador-livre-<versao>-x64.msi`
+- `assinador-livre-rs-<versao>-x64.msi`
 
 Fluxo recomendado:
 
@@ -52,7 +56,7 @@ cargo build --release
 Binario esperado:
 
 ```text
-target\\release\\assinador-livre.exe
+target\\release\\assinador-livre-rs.exe
 ```
 
 ## Build do instalador MSI (desenvolvimento)
@@ -72,16 +76,16 @@ target\\wix\\*.msi
 
 ```powershell
 # Modo bandeja (default)
-assinador-livre.exe
+assinador-livre-rs.exe
 
 # Fluxo imediato de assinatura (abre seletor de PDF e encerra)
-assinador-livre.exe --sign-now
+assinador-livre-rs.exe --sign-now
 
 # Mostra caminho do config
-assinador-livre.exe --print-config-path
+assinador-livre-rs.exe --print-config-path
 
 # Logs mais verbosos
-assinador-livre.exe --verbose
+assinador-livre-rs.exe --verbose
 ```
 
 ## Configuracao
@@ -335,7 +339,7 @@ Contrato operacional:
 - cada novo release exige bump em `version` no `Cargo.toml`;
 - se a versao atual ja existir no ultimo release estavel, o workflow falha;
 - o release e publicado com tag `v<versao>`;
-- o asset publicado segue o padrao `assinador-livre-<versao>-x64.msi`.
+- o asset publicado segue o padrao `assinador-livre-rs-<versao>-x64.msi`.
 
 ## Desenvolvimento
 

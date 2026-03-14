@@ -36,8 +36,8 @@
             <Component Id="MainExecutableComponent" Guid="6D6BC45E-B8E5-47D6-8E62-2D3C2C3C1E13">
               <File
                 Id="AssinadorLivreExe"
-                Name="assinador-livre.exe"
-                Source="$(var.CargoTargetBinDir)\assinador-livre.exe"
+                Name="assinador-livre-rs.exe"
+                Source="$(var.CargoTargetBinDir)\assinador-livre-rs.exe"
                 KeyPath="yes" />
             </Component>
           </Directory>

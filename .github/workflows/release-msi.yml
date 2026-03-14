@@ -102,7 +102,7 @@ jobs:
             Write-Error "Nenhum arquivo MSI foi gerado em target\\wix"
             exit 1
           }
-          $assetName = "assinador-livre-$env:APP_VERSION-x64.msi"
+          $assetName = "assinador-livre-rs-$env:APP_VERSION-x64.msi"
           $assetPath = Join-Path $msi.DirectoryName $assetName
           Copy-Item $msi.FullName $assetPath -Force
           "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append

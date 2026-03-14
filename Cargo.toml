@@ -1,10 +1,14 @@
 [package]
-name = "assinador-livre"
+name = "assinador-livre-rs"
 version = "0.1.2"
 edition = "2024"
 rust-version = "1.93"
-description = "Aplicacao desktop para assinatura digital de PDF com certificado A3 no Windows"
+description = "Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 no Windows, com API WebSocket local"
 license = "MIT"
+repository = "https://github.com/celsowm/assinador-livre-rs"
+homepage = "https://github.com/celsowm/assinador-livre-rs"
+keywords = ["pdf", "assinatura-digital", "windows", "websocket", "a3"]
+categories = ["cryptography"]
 
 [dependencies]
 anyhow = "1"
