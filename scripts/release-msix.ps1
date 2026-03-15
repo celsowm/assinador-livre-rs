@@ -4,9 +4,9 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Publisher,
   [Parameter(Mandatory = $false)]
-  [string]$DisplayName = "Assinador Livre RS",
+[string]$DisplayName = "Assinador Livre RS",
   [Parameter(Mandatory = $false)]
-  [string]$PublisherDisplayName = "Assinador Livre",
+  [string]$PublisherDisplayName = "celsowm",
   [Parameter(Mandatory = $false)]
   [string]$Description = "Aplicacao desktop para assinatura digital de PDF com certificado A3 no Windows",
   [Parameter(Mandatory = $false)]

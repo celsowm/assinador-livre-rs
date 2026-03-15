@@ -15,6 +15,7 @@ jobs:
     env:
       MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
       MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+      MSIX_PUBLISHER_DISPLAY_NAME: ${{ vars.MSIX_PUBLISHER_DISPLAY_NAME }}
 
     steps:
       - name: Checkout
@@ -45,4 +46,5 @@ jobs:
         run: |
           ./scripts/release-msix.ps1 `
             -IdentityName "$env:MSIX_IDENTITY_NAME" `
-            -Publisher "$env:MSIX_PUBLISHER"
+            -Publisher "$env:MSIX_PUBLISHER" `
+            -PublisherDisplayName "$env:MSIX_PUBLISHER_DISPLAY_NAME"

@@ -109,6 +109,7 @@ Configure em `Settings -> Secrets and variables -> Actions -> Variables`:
 
 - `MSIX_IDENTITY_NAME`
 - `MSIX_PUBLISHER`
+- `MSIX_PUBLISHER_DISPLAY_NAME` (deve bater com o display name do publisher no Partner Center, ex.: `celsowm`)
 
 Depois disso, todo `push` na `main` gera e anexa `assinador-livre-rs-<versao>-x64.msix` na release `v<versao>`.
 
