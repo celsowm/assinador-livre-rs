@@ -72,6 +72,46 @@ Saida esperada:
 target\\wix\\*.msi
 ```
 
+## Build MSIX (automacao local)
+
+Scripts disponiveis:
+
+- `scripts\\build-msix.ps1`: gera `target\\msix\\assinador-livre-rs-<versao>-x64.msix`
+- `scripts\\release-msix.ps1`: gera MSIX e faz upload para release `v<versao>` no GitHub
+
+Exemplo (somente gerar):
+
+```powershell
+.\scripts\build-msix.ps1 `
+  -IdentityName "SEU_PACKAGE_IDENTITY_NAME" `
+  -Publisher "CN=SEU_PUBLISHER_ID" `
+  -DisplayName "Assinador Livre RS"
+```
+
+Exemplo (gerar e publicar na release):
+
+```powershell
+.\scripts\release-msix.ps1 `
+  -IdentityName "SEU_PACKAGE_IDENTITY_NAME" `
+  -Publisher "CN=SEU_PUBLISHER_ID"
+```
+
+Observacoes:
+
+- `IdentityName` e `Publisher` devem ser os mesmos da identidade de pacote esperada pela Store para o app MSIX.
+- para assinar localmente, passe `-PfxPath` e `-PfxPassword` no script.
+
+### Automacao no GitHub Actions (MSIX)
+
+Workflow: `.github/workflows/release-msix.yml`
+
+Configure em `Settings -> Secrets and variables -> Actions -> Variables`:
+
+- `MSIX_IDENTITY_NAME`
+- `MSIX_PUBLISHER`
+
+Depois disso, todo `push` na `main` gera e anexa `assinador-livre-rs-<versao>-x64.msix` na release `v<versao>`.
+
 ## Modos de execucao (CLI)
 
 ```powershell
@@ -330,16 +370,60 @@ Assim, o comportamento fica redundante por seguranca:
 - o MSI grava a entrada para o usuario instalador;
 - o proprio app revalida/atualiza a entrada ao iniciar.
 
-## Release automatico no GitHub
+## Release automatico no GitHub e Store
 
-O workflow `.github/workflows/release-msi.yml` publica release estavel ao receber `push` na `main`.
+O workflow `.github/workflows/release-msi.yml` cobre:
 
-Contrato operacional:
+- build do executavel;
+- assinatura de `assinador-livre-rs.exe` e `.msi` via Azure Key Vault;
+- publicacao de release no GitHub;
+- criacao/atualizacao de submissao da Microsoft Store (EXE/MSI);
+- envio para certificacao (quando `submit=true`).
 
-- cada novo release exige bump em `version` no `Cargo.toml`;
-- se a versao atual ja existir no ultimo release estavel, o workflow falha;
-- o release e publicado com tag `v<versao>`;
-- o asset publicado segue o padrao `assinador-livre-rs-<versao>-x64.msi`.
+### Segredos necessarios
+
+Configure no repositorio (GitHub Secrets):
+
+- `AZURE_TENANT_ID`
+- `AZURE_CLIENT_ID`
+- `AZURE_CLIENT_SECRET`
+- `AZURE_KEYVAULT_URL`
+- `AZURE_CERT_NAME`
+- `STORE_APP_ID` (Product ID no Partner Center)
+- `STORE_SELLER_ID` (Seller/Publisher Account ID para header `X-Seller-Account-Id`)
+
+Alternativa sem assinatura Azure (sem Key Vault):
+
+- `WINDOWS_SIGN_PFX_BASE64` (arquivo `.pfx` convertido para base64)
+- `WINDOWS_SIGN_PFX_PASSWORD` (senha do `.pfx`)
+
+Quando `WINDOWS_SIGN_PFX_*` estiver definido, o workflow usa PFX automaticamente e ignora assinatura via Key Vault.
+
+### Modo automatico (push em `main`)
+
+- exige bump de `version` no `Cargo.toml`;
+- gera tag `v<versao>` quando ainda nao existe;
+- publica asset `assinador-livre-rs-<versao>-x64.msi`;
+- envia automaticamente para certificacao da Store.
+
+### Modo manual (`workflow_dispatch`)
+
+Inputs disponiveis:
+
+- `submit` (`true|false`): envia ou nao para certificacao;
+- `dry_run` (`true|false`): valida pacote e gera payload sem gravar na Store;
+- `version_override` (opcional): usa versao diferente da detectada no `Cargo.toml`;
+- `package_url_override` (opcional): usa URL externa e pula build/release.
+
+### Regras de seguranca implementadas
+
+- idempotencia: bloqueia quando ha submissao em andamento;
+- idempotencia: bloqueia quando o draft ja contem o mesmo `packageUrl`;
+- validacao pre-submit:
+  - URL do pacote responde `2xx`;
+  - nome do asset confere com o padrao esperado;
+  - MSI baixado tem `ProductVersion` igual a versao esperada;
+  - assinatura Authenticode do MSI esta valida.
 
 ## Desenvolvimento
 

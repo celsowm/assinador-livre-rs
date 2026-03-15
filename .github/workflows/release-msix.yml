@@ -1,0 +1,46 @@
+name: Release MSIX
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-msix:
+    runs-on: windows-latest
+    env:
+      MSIX_IDENTITY_NAME: ${{ vars.MSIX_IDENTITY_NAME }}
+      MSIX_PUBLISHER: ${{ vars.MSIX_PUBLISHER }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate MSIX config
+        shell: pwsh
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_IDENTITY_NAME)) { $missing += "MSIX_IDENTITY_NAME (Repository Variable)" }
+          if ([string]::IsNullOrWhiteSpace($env:MSIX_PUBLISHER)) { $missing += "MSIX_PUBLISHER (Repository Variable)" }
+          if ($missing.Count -gt 0) {
+            Write-Error ("Configuracao ausente: " + ($missing -join ", "))
+            exit 1
+          }
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build and release MSIX
+        shell: pwsh
+        run: |
+          ./scripts/release-msix.ps1 `
+            -IdentityName "$env:MSIX_IDENTITY_NAME" `
+            -Publisher "$env:MSIX_PUBLISHER"

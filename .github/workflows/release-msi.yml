@@ -1,9 +1,29 @@
-name: Release MSI
+name: Release MSI and Store Submission
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      submit:
+        description: "Submit to Microsoft Store after package commit"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Validate and generate payload without calling Store write APIs"
+        required: false
+        default: true
+        type: boolean
+      version_override:
+        description: "Optional version override (uses Cargo.toml when empty)"
+        required: false
+        type: string
+      package_url_override:
+        description: "Optional MSI URL override (skip release build/publish when set)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +31,14 @@ permissions:
 jobs:
   release-msi:
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      asset_name: ${{ steps.version.outputs.asset_name }}
+      package_url: ${{ steps.package_url.outputs.package_url }}
+      asset_path: ${{ steps.artifact.outputs.asset_path }}
+      should_release: ${{ steps.release_guard.outputs.should_release }}
+      signing_mode: ${{ steps.signing_mode.outputs.mode }}
 
     steps:
       - name: Checkout
@@ -18,34 +46,142 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Read app version from Cargo.toml
-        id: app_version
+      - name: Resolve app version and asset naming
+        id: version
         shell: pwsh
+        env:
+          VERSION_OVERRIDE: ${{ github.event.inputs.version_override }}
         run: |
-          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
-          if ([string]::IsNullOrWhiteSpace($version)) {
+          $cargoVersion = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ([string]::IsNullOrWhiteSpace($cargoVersion)) {
             Write-Error "Nao foi possivel extrair a versao do Cargo.toml"
             exit 1
           }
+
+          $version = $cargoVersion
+          if (-not [string]::IsNullOrWhiteSpace($env:VERSION_OVERRIDE)) {
+            $version = $env:VERSION_OVERRIDE.Trim()
+            Write-Host "Usando version_override: $version"
+          }
+
+          $tag = "v$version"
+          $assetName = "assinador-livre-rs-$version-x64.msi"
+
           "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "tag=v$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "cargo_version=$cargoVersion" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "asset_name=$assetName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Detect if release should run
         id: release_guard
         shell: pwsh
         env:
-          RELEASE_TAG: ${{ steps.app_version.outputs.tag }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PACKAGE_URL_OVERRIDE: ${{ github.event.inputs.package_url_override }}
         run: |
+          if (-not [string]::IsNullOrWhiteSpace($env:PACKAGE_URL_OVERRIDE)) {
+            Write-Host "package_url_override definido. Build/release sera ignorado."
+            "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 0
+          }
+
           git fetch --tags --force
           $tag = $env:RELEASE_TAG
           $existing = git tag -l $tag
           if (-not [string]::IsNullOrWhiteSpace($existing)) {
-            Write-Host "Tag $tag ja existe. Este push sera concluido sem publicar novo release."
+            Write-Host "Tag $tag ja existe. Build/release sera ignorado."
             "should_release=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
             exit 0
           }
-          Write-Host "Tag $tag ainda nao existe. Release sera publicada."
+
+          Write-Host "Tag $tag ainda nao existe. Build/release sera executado."
           "should_release=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Resolve package URL
+        id: package_url
+        shell: pwsh
+        env:
+          PACKAGE_URL_OVERRIDE: ${{ github.event.inputs.package_url_override }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
+        run: |
+          $packageUrl = $env:PACKAGE_URL_OVERRIDE
+          if ([string]::IsNullOrWhiteSpace($packageUrl)) {
+            $packageUrl = "https://github.com/$($env:REPOSITORY)/releases/download/$($env:TAG)/$($env:ASSET_NAME)"
+          }
+          "package_url=$packageUrl" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Package URL: $packageUrl"
+
+      - name: Resolve signing mode
+        id: signing_mode
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_KEYVAULT_URL: ${{ secrets.AZURE_KEYVAULT_URL }}
+          AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          $hasPfx = (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_PFX_BASE64)) -and (-not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_PFX_PASSWORD))
+          $hasKeyVault = @(
+            (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID)),
+            (-not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)),
+            (-not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)),
+            (-not [string]::IsNullOrWhiteSpace($env:AZURE_KEYVAULT_URL)),
+            (-not [string]::IsNullOrWhiteSpace($env:AZURE_CERT_NAME))
+          ) -notcontains $false
+
+          if ($hasPfx) {
+            "mode=pfx" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Signing mode: pfx"
+            exit 0
+          }
+
+          if ($hasKeyVault) {
+            "mode=keyvault" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            Write-Host "Signing mode: keyvault"
+            exit 0
+          }
+
+          Write-Error "Nenhum modo de assinatura configurado. Configure PFX (WINDOWS_SIGN_PFX_*) ou Azure Key Vault (AZURE_*)."
+          exit 1
+
+      - name: Validate signing secret presence (keyvault)
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_KEYVAULT_URL: ${{ secrets.AZURE_KEYVAULT_URL }}
+          AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+        run: |
+          if ("${{ steps.signing_mode.outputs.mode }}" -ne "keyvault") {
+            Write-Host "Assinatura Key Vault nao sera usada nesta execucao."
+            exit 0
+          }
+
+          $required = @(
+            "AZURE_TENANT_ID",
+            "AZURE_CLIENT_ID",
+            "AZURE_CLIENT_SECRET",
+            "AZURE_KEYVAULT_URL",
+            "AZURE_CERT_NAME"
+          )
+          $missing = @()
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error ("Segredos ausentes para assinatura: " + ($missing -join ", "))
+            exit 1
+          }
 
       - name: Setup Rust
         if: steps.release_guard.outputs.should_release == 'true'
@@ -80,10 +216,58 @@ jobs:
           "PATH=$wixBin;$env:PATH" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           Write-Host "WiX configurado em $wixBin"
 
+      - name: Install AzureSignTool
+        if: steps.release_guard.outputs.should_release == 'true' && steps.signing_mode.outputs.mode == 'keyvault'
+        shell: pwsh
+        run: dotnet tool install --global AzureSignTool
+
       - name: Build release binary
         if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Sign EXE with Azure Key Vault
+        if: steps.release_guard.outputs.should_release == 'true' && steps.signing_mode.outputs.mode == 'keyvault'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_KEYVAULT_URL: ${{ secrets.AZURE_KEYVAULT_URL }}
+          AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+        run: |
+          $exePath = Resolve-Path "target\release\assinador-livre-rs.exe"
+          AzureSignTool sign `
+            -kvu "$env:AZURE_KEYVAULT_URL" `
+            -kvi "$env:AZURE_CLIENT_ID" `
+            -kvt "$env:AZURE_TENANT_ID" `
+            -kvs "$env:AZURE_CLIENT_SECRET" `
+            -kvc "$env:AZURE_CERT_NAME" `
+            -tr "http://timestamp.digicert.com" `
+            -v `
+            "$exePath"
+
+      - name: Sign EXE with PFX
+        if: steps.release_guard.outputs.should_release == 'true' && steps.signing_mode.outputs.mode == 'pfx'
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [System.IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGN_PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword -Exportable
+          if (-not $cert) {
+            Write-Error "Falha ao importar PFX para assinatura."
+            exit 1
+          }
+          $exePath = Resolve-Path "target\release\assinador-livre-rs.exe"
+          $result = Set-AuthenticodeSignature -FilePath $exePath -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
+          if ($result.Status -ne "Valid") {
+            Write-Error "Falha ao assinar EXE com PFX. Status: $($result.Status)"
+            exit 1
+          }
 
       - name: Build MSI
         if: steps.release_guard.outputs.should_release == 'true'
@@ -95,25 +279,159 @@ jobs:
         if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
         env:
-          APP_VERSION: ${{ steps.app_version.outputs.version }}
+          ASSET_NAME: ${{ steps.version.outputs.asset_name }}
         run: |
           $msi = Get-ChildItem -Path target\wix -Filter *.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
           if (-not $msi) {
             Write-Error "Nenhum arquivo MSI foi gerado em target\\wix"
             exit 1
           }
-          $assetName = "assinador-livre-rs-$env:APP_VERSION-x64.msi"
-          $assetPath = Join-Path $msi.DirectoryName $assetName
+          $assetPath = Join-Path $msi.DirectoryName $env:ASSET_NAME
           Copy-Item $msi.FullName $assetPath -Force
           "asset_path=$assetPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Sign MSI with Azure Key Vault
+        if: steps.release_guard.outputs.should_release == 'true' && steps.signing_mode.outputs.mode == 'keyvault'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_KEYVAULT_URL: ${{ secrets.AZURE_KEYVAULT_URL }}
+          AZURE_CERT_NAME: ${{ secrets.AZURE_CERT_NAME }}
+          MSI_PATH: ${{ steps.artifact.outputs.asset_path }}
+        run: |
+          AzureSignTool sign `
+            -kvu "$env:AZURE_KEYVAULT_URL" `
+            -kvi "$env:AZURE_CLIENT_ID" `
+            -kvt "$env:AZURE_TENANT_ID" `
+            -kvs "$env:AZURE_CLIENT_SECRET" `
+            -kvc "$env:AZURE_CERT_NAME" `
+            -tr "http://timestamp.digicert.com" `
+            -v `
+            "$env:MSI_PATH"
+
+      - name: Sign MSI with PFX
+        if: steps.release_guard.outputs.should_release == 'true' && steps.signing_mode.outputs.mode == 'pfx'
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+          MSI_PATH: ${{ steps.artifact.outputs.asset_path }}
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [System.IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX_BASE64))
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGN_PFX_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword -Exportable
+          if (-not $cert) {
+            Write-Error "Falha ao importar PFX para assinatura."
+            exit 1
+          }
+          $result = Set-AuthenticodeSignature -FilePath $env:MSI_PATH -Certificate $cert -TimestampServer "http://timestamp.digicert.com" -HashAlgorithm SHA256
+          if ($result.Status -ne "Valid") {
+            Write-Error "Falha ao assinar MSI com PFX. Status: $($result.Status)"
+            exit 1
+          }
 
       - name: Publish GitHub Release
         if: steps.release_guard.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.app_version.outputs.tag }}
-          name: ${{ steps.app_version.outputs.tag }}
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
           draft: false
           prerelease: false
           generate_release_notes: true
           files: ${{ steps.artifact.outputs.asset_path }}
+
+  store-submission:
+    runs-on: windows-latest
+    needs: release-msi
+    if: needs.release-msi.outputs.package_url != '' && (github.event_name == 'workflow_dispatch' || needs.release-msi.outputs.should_release == 'true')
+    outputs:
+      submission_id: ${{ steps.store.outputs.submission_id }}
+      package_url: ${{ needs.release-msi.outputs.package_url }}
+      version: ${{ needs.release-msi.outputs.version }}
+      submission_status_url: ${{ steps.store.outputs.submission_status_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Store execution mode
+        id: mode
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_SUBMIT: ${{ github.event.inputs.submit }}
+          INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          $submit = $false
+          $dryRun = $false
+
+          if ($env:EVENT_NAME -eq "push") {
+            $submit = $true
+            $dryRun = $false
+          } else {
+            $submit = ($env:INPUT_SUBMIT -eq "true")
+            $dryRun = ($env:INPUT_DRY_RUN -eq "true")
+          }
+
+          "submit=$($submit.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "dry_run=$($dryRun.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Store mode => submit=$submit dry_run=$dryRun"
+
+      - name: Validate Store API secret presence
+        if: steps.mode.outputs.dry_run != 'true'
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          STORE_APP_ID: ${{ secrets.STORE_APP_ID }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+        run: |
+          $required = @(
+            "AZURE_TENANT_ID",
+            "AZURE_CLIENT_ID",
+            "AZURE_CLIENT_SECRET",
+            "STORE_APP_ID",
+            "STORE_SELLER_ID"
+          )
+          $missing = @()
+          foreach ($name in $required) {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Error ("Segredos ausentes para Store: " + ($missing -join ", "))
+            exit 1
+          }
+
+      - name: Create/Update Store submission
+        id: store
+        shell: pwsh
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          STORE_APP_ID: ${{ secrets.STORE_APP_ID }}
+          STORE_SELLER_ID: ${{ secrets.STORE_SELLER_ID }}
+          PACKAGE_URL: ${{ needs.release-msi.outputs.package_url }}
+          EXPECTED_VERSION: ${{ needs.release-msi.outputs.version }}
+          EXPECTED_ASSET_NAME: ${{ needs.release-msi.outputs.asset_name }}
+          SUBMIT: ${{ steps.mode.outputs.submit }}
+          DRY_RUN: ${{ steps.mode.outputs.dry_run }}
+        run: |
+          ./scripts/store-submit.ps1 `
+            -TenantId "$env:AZURE_TENANT_ID" `
+            -ClientId "$env:AZURE_CLIENT_ID" `
+            -ClientSecret "$env:AZURE_CLIENT_SECRET" `
+            -SellerId "$env:STORE_SELLER_ID" `
+            -ProductId "$env:STORE_APP_ID" `
+            -PackageUrl "$env:PACKAGE_URL" `
+            -ExpectedVersion "$env:EXPECTED_VERSION" `
+            -ExpectedAssetName "$env:EXPECTED_ASSET_NAME" `
+            -Submit:($env:SUBMIT -eq "true") `
+            -DryRun:($env:DRY_RUN -eq "true")
