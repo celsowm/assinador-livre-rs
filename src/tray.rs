@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
@@ -7,7 +7,7 @@ use std::{
 };
 use tray_item::{IconSource, TrayItem};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    LoadIconW, LoadImageW, HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_LOADFROMFILE,
+    HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_LOADFROMFILE, LoadIconW, LoadImageW,
 };
 
 use crate::logger;

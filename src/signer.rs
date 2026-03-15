@@ -1,9 +1,9 @@
 use crate::{config::CertOverride, logger};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use lopdf::{Document, Object, ObjectId};
 use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::{self, Write as _},
@@ -12,8 +12,8 @@ use std::{
     slice,
 };
 use windows::{
-    core::{w, PSTR},
     Win32::{Foundation::BOOL, Security::Cryptography::*},
+    core::{PSTR, w},
 };
 
 pub struct SignReport {
@@ -28,6 +28,24 @@ pub struct WsSignResult {
     pub cert_thumbprint: String,
     pub cert_is_hardware_token: bool,
     pub cert_provider_name: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CertificateSummary {
+    pub index: usize,
+    pub subject: String,
+    pub issuer: String,
+    pub thumbprint: String,
+    pub is_hardware_token: bool,
+    pub provider_name: String,
+    pub valid_now: bool,
+    pub supports_digital_signature: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CertSelectionRequest {
+    pub thumbprint: Option<String>,
+    pub index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -120,6 +138,15 @@ impl Drop for OwnedCert {
 }
 
 pub fn sign_selected_files(cert_override: &CertOverride, verbose: bool) -> Result<SignReport> {
+    sign_selected_files_with_selection(cert_override, verbose, None, None)
+}
+
+pub fn sign_selected_files_with_selection(
+    cert_override: &CertOverride,
+    verbose: bool,
+    cert_selection: Option<CertSelectionRequest>,
+    visible_signature: Option<VisibleSignatureRequest>,
+) -> Result<SignReport> {
     let pdfs = select_pdfs();
     if pdfs.is_empty() {
         return Ok(SignReport {
@@ -129,8 +156,15 @@ pub fn sign_selected_files(cert_override: &CertOverride, verbose: bool) -> Resul
     }
 
     let certs = load_available_certificates()?;
-    let cert_idx = choose_certificate_index(&certs, cert_override, verbose)?;
+    let cert_idx =
+        choose_certificate_index(&certs, cert_override, cert_selection.as_ref(), verbose)?;
     let cert = &certs[cert_idx];
+    let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
+        placement: cfg.placement,
+        signer_name: cert.subject.clone(),
+        style: cfg.style,
+        timezone: cfg.timezone,
+    });
 
     let mut report = SignReport {
         signed: Vec::new(),
@@ -143,7 +177,16 @@ pub fn sign_selected_files(cert_override: &CertOverride, verbose: bool) -> Resul
         print!("[{}/{}] Assinando: {}... ", i + 1, pdfs.len(), nome);
         io::stdout().flush().ok();
 
-        match sign_pdf_file(input, &output, cert.context) {
+        match fs::read(input)
+            .with_context(|| format!("Falha ao ler {}", input.display()))
+            .and_then(|original| {
+                sign_pdf_bytes(&original, cert.context, visible_signature.as_ref())
+                    .with_context(|| format!("Falha ao assinar {}", input.display()))
+            })
+            .and_then(|signed| {
+                fs::write(&output, signed)
+                    .with_context(|| format!("Falha ao gravar {}", output.display()))
+            }) {
             Ok(()) => {
                 println!("OK");
                 report.signed.push(nome);
@@ -164,9 +207,11 @@ pub fn sign_single_pdf_bytes(
     cert_override: &CertOverride,
     verbose: bool,
     visible_signature: Option<VisibleSignatureRequest>,
+    cert_selection: Option<CertSelectionRequest>,
 ) -> Result<WsSignResult> {
     let certs = load_available_certificates()?;
-    let cert_idx = choose_certificate_index(&certs, cert_override, verbose)?;
+    let cert_idx =
+        choose_certificate_index(&certs, cert_override, cert_selection.as_ref(), verbose)?;
     let cert = &certs[cert_idx];
 
     let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
@@ -214,20 +259,26 @@ pub fn sign_batch_pdf_bytes(
     inputs: Vec<BatchFileInput>,
     cert_override: &CertOverride,
     verbose: bool,
+    cert_selection: Option<CertSelectionRequest>,
 ) -> Result<BatchSignResult> {
     let certs = load_available_certificates()?;
-    let cert_idx = choose_certificate_index(&certs, cert_override, verbose)?;
+    let cert_idx =
+        choose_certificate_index(&certs, cert_override, cert_selection.as_ref(), verbose)?;
     let cert = &certs[cert_idx];
 
     let mut file_results = Vec::with_capacity(inputs.len());
 
     for input in &inputs {
-        let visible_signature = input.visible_signature.as_ref().map(|cfg| VisibleSignatureAppearance {
-            placement: cfg.placement,
-            signer_name: cert.subject.clone(),
-            style: cfg.style,
-            timezone: cfg.timezone,
-        });
+        let visible_signature =
+            input
+                .visible_signature
+                .as_ref()
+                .map(|cfg| VisibleSignatureAppearance {
+                    placement: cfg.placement,
+                    signer_name: cert.subject.clone(),
+                    style: cfg.style,
+                    timezone: cfg.timezone,
+                });
 
         match sign_pdf_bytes(&input.pdf_bytes, cert.context, visible_signature.as_ref()) {
             Ok(signed_pdf) => {
@@ -257,14 +308,6 @@ pub fn sign_batch_pdf_bytes(
         cert_is_hardware_token: cert.is_hardware_token,
         cert_provider_name: cert.key_provider_name.clone(),
     })
-}
-
-pub fn sign_pdf_file(input: &Path, output: &Path, cert_ctx: *const CERT_CONTEXT) -> Result<()> {
-    let original = fs::read(input)?;
-    let signed = sign_pdf_bytes(&original, cert_ctx, None)
-        .with_context(|| format!("Falha ao assinar {}", input.display()))?;
-    fs::write(output, signed).with_context(|| format!("Falha ao gravar {}", output.display()))?;
-    Ok(())
 }
 
 pub fn sign_pdf_bytes(
@@ -383,11 +426,7 @@ pub fn sign_pdf_bytes(
 
     if let (Some(ap_num), Some(font_num), Some(visible_cfg)) = (ap_num, font_num, visible_signature)
     {
-        let appearance = build_visible_signature_appearance(
-            widget_rect,
-            visible_cfg,
-            signed_at,
-        );
+        let appearance = build_visible_signature_appearance(widget_rect, visible_cfg, signed_at);
         xref_entries.push(XrefEntry::new(ap_num, 0, original.len() + upd.len()));
         write!(upd, "{ap_num} 0 obj\n<<\n")?;
         write!(upd, "/Type /XObject\n/Subtype /Form\n")?;
@@ -651,9 +690,7 @@ fn compute_visible_signature_rect(
         VisibleSignaturePlacement::BottomCenterHorizontal
         | VisibleSignaturePlacement::BottomCenterVertical
         | VisibleSignaturePlacement::CenterHorizontal
-        | VisibleSignaturePlacement::CenterVertical => {
-            llx + (urx - llx - width) / 2.0
-        }
+        | VisibleSignaturePlacement::CenterVertical => llx + (urx - llx - width) / 2.0,
     };
 
     let y = match placement {
@@ -690,7 +727,11 @@ fn build_visible_signature_appearance(
     } else {
         width
     };
-    let text_height = if cfg.placement.is_vertical() { width } else { height };
+    let text_height = if cfg.placement.is_vertical() {
+        width
+    } else {
+        height
+    };
 
     let mut text_lines = Vec::new();
     let mut selected_font_size = preset.min_font_size;
@@ -705,10 +746,7 @@ fn build_visible_signature_appearance(
             max_chars,
             2,
         );
-        let date_line = truncate_with_ellipsis(
-            &format!("Data/Hora: {}", local_dt),
-            max_chars,
-        );
+        let date_line = truncate_with_ellipsis(&format!("Data/Hora: {}", local_dt), max_chars);
         let lines = vec![
             "Assinado digitalmente".to_string(),
             signer_lines.first().cloned().unwrap_or_default(),
@@ -812,7 +850,11 @@ fn format_visible_signature_datetime(
         VisibleSignatureTimezone::Utc => signed_at.format("%d/%m/%Y %H:%M:%S UTC").to_string(),
         VisibleSignatureTimezone::Local => {
             let local = signed_at.with_timezone(&Local);
-            format!("{} GMT{}", local.format("%d/%m/%Y %H:%M:%S"), local.format("%:z"))
+            format!(
+                "{} GMT{}",
+                local.format("%d/%m/%Y %H:%M:%S"),
+                local.format("%:z")
+            )
         }
     }
 }
@@ -905,6 +947,36 @@ pub fn normalize_thumbprint(raw: &str) -> String {
         .to_ascii_uppercase()
 }
 
+pub fn list_available_certificates() -> Result<Vec<CertificateSummary>> {
+    let certs = list_my_certificates()
+        .context("Falha ao acessar o repositorio de certificados do Windows")?;
+
+    Ok(certs
+        .iter()
+        .enumerate()
+        .map(|(idx, cert)| certificate_summary_from_owned(cert, idx))
+        .collect())
+}
+
+pub fn recommended_certificate_index(cert_override: &CertOverride, verbose: bool) -> Result<usize> {
+    let certs = load_available_certificates()?;
+    let idx = choose_certificate_index(&certs, cert_override, None, verbose)?;
+    Ok(idx + 1)
+}
+
+fn certificate_summary_from_owned(cert: &OwnedCert, idx: usize) -> CertificateSummary {
+    CertificateSummary {
+        index: idx + 1,
+        subject: cert.subject.clone(),
+        issuer: cert.issuer.clone(),
+        thumbprint: cert.thumbprint.clone(),
+        is_hardware_token: cert.is_hardware_token,
+        provider_name: cert.key_provider_name.clone(),
+        valid_now: cert.valid_now,
+        supports_digital_signature: cert.supports_digital_signature,
+    }
+}
+
 fn load_available_certificates() -> Result<Vec<OwnedCert>> {
     let certs = list_my_certificates()
         .context("Falha ao acessar o repositorio de certificados do Windows")?;
@@ -922,8 +994,45 @@ fn load_available_certificates() -> Result<Vec<OwnedCert>> {
 fn choose_certificate_index(
     certs: &[OwnedCert],
     cert_override: &CertOverride,
+    cert_selection: Option<&CertSelectionRequest>,
     verbose: bool,
 ) -> Result<usize> {
+    if let Some(selection) = cert_selection {
+        if let Some(tp) = selection.thumbprint.as_ref() {
+            let wanted = normalize_thumbprint(tp);
+            if wanted.is_empty() {
+                bail!("cert_thumbprint invalido: informe ao menos um caractere hexadecimal");
+            }
+            if let Some((idx, _)) = certs
+                .iter()
+                .enumerate()
+                .find(|(_, cert)| cert.thumbprint == wanted)
+            {
+                ensure_mode_allows_certificate(&certs[idx], &cert_override.mode)?;
+                log_certificate_selection(certs, idx, "request.cert_thumbprint");
+                return Ok(idx);
+            }
+            bail!(
+                "cert_thumbprint '{}' nao encontrado no repositorio 'Minhas'.",
+                wanted
+            );
+        }
+
+        if let Some(index) = selection.index {
+            if (1..=certs.len()).contains(&index) {
+                let selected = index - 1;
+                ensure_mode_allows_certificate(&certs[selected], &cert_override.mode)?;
+                log_certificate_selection(certs, selected, "request.cert_index");
+                return Ok(selected);
+            }
+            bail!(
+                "cert_index invalido: {}. Valores aceitos: 1..={}",
+                index,
+                certs.len()
+            );
+        }
+    }
+
     if let Some(index) = cert_override.index {
         if (1..=certs.len()).contains(&index) {
             let selected = index - 1;
@@ -1446,100 +1555,106 @@ fn looks_like_hardware_token(provider_name: &str, container_name: &str) -> bool 
     false
 }
 
-unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String { unsafe {
-    if ptr.is_null() {
-        return String::new();
+unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String {
+    unsafe {
+        if ptr.is_null() {
+            return String::new();
+        }
+
+        let mut len = 0usize;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+
+        if len == 0 {
+            return String::new();
+        }
+
+        let slice = slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice)
     }
+}
 
-    let mut len = 0usize;
-    while *ptr.add(len) != 0 {
-        len += 1;
+unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String {
+    unsafe {
+        let len = CertGetNameStringW(ctx, name_type, flags, None, None);
+        if len <= 1 {
+            return String::new();
+        }
+
+        let mut buf = vec![0u16; len as usize];
+        let _ = CertGetNameStringW(ctx, name_type, flags, None, Some(&mut buf));
+
+        String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)])
     }
-
-    if len == 0 {
-        return String::new();
-    }
-
-    let slice = slice::from_raw_parts(ptr, len);
-    String::from_utf16_lossy(slice)
-}}
-
-unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String { unsafe {
-    let len = CertGetNameStringW(ctx, name_type, flags, None, None);
-    if len <= 1 {
-        return String::new();
-    }
-
-    let mut buf = vec![0u16; len as usize];
-    let _ = CertGetNameStringW(ctx, name_type, flags, None, Some(&mut buf));
-
-    String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)])
-}}
+}
 
 static SHA256_OID: &[u8] = b"2.16.840.1.101.3.4.2.1\0";
 
-unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) -> Result<Vec<u8>> { unsafe {
-    const ENCODING: u32 = X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0;
+unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) -> Result<Vec<u8>> {
+    unsafe {
+        const ENCODING: u32 = X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0;
 
-    let hash_alg = CRYPT_ALGORITHM_IDENTIFIER {
-        pszObjId: PSTR(SHA256_OID.as_ptr() as *mut u8),
-        Parameters: CRYPT_INTEGER_BLOB {
-            cbData: 0,
-            pbData: std::ptr::null_mut(),
-        },
-    };
+        let hash_alg = CRYPT_ALGORITHM_IDENTIFIER {
+            pszObjId: PSTR(SHA256_OID.as_ptr() as *mut u8),
+            Parameters: CRYPT_INTEGER_BLOB {
+                cbData: 0,
+                pbData: std::ptr::null_mut(),
+            },
+        };
 
-    let sign_para = CRYPT_SIGN_MESSAGE_PARA {
-        cbSize: mem::size_of::<CRYPT_SIGN_MESSAGE_PARA>() as u32,
-        dwMsgEncodingType: ENCODING,
-        pSigningCert: cert_ctx,
-        HashAlgorithm: hash_alg,
-        pvHashAuxInfo: std::ptr::null_mut(),
-        cMsgCert: 0,
-        rgpMsgCert: std::ptr::null_mut(),
-        cMsgCrl: 0,
-        rgpMsgCrl: std::ptr::null_mut(),
-        cAuthAttr: 0,
-        rgAuthAttr: std::ptr::null_mut(),
-        cUnauthAttr: 0,
-        rgUnauthAttr: std::ptr::null_mut(),
-        dwFlags: 0,
-        dwInnerContentType: 0,
-    };
+        let sign_para = CRYPT_SIGN_MESSAGE_PARA {
+            cbSize: mem::size_of::<CRYPT_SIGN_MESSAGE_PARA>() as u32,
+            dwMsgEncodingType: ENCODING,
+            pSigningCert: cert_ctx,
+            HashAlgorithm: hash_alg,
+            pvHashAuxInfo: std::ptr::null_mut(),
+            cMsgCert: 0,
+            rgpMsgCert: std::ptr::null_mut(),
+            cMsgCrl: 0,
+            rgpMsgCrl: std::ptr::null_mut(),
+            cAuthAttr: 0,
+            rgAuthAttr: std::ptr::null_mut(),
+            cUnauthAttr: 0,
+            rgUnauthAttr: std::ptr::null_mut(),
+            dwFlags: 0,
+            dwInnerContentType: 0,
+        };
 
-    let data_ptr: *const u8 = signed_bytes.as_ptr();
-    let data_ptrs = [data_ptr];
-    let data_size: u32 = signed_bytes.len() as u32;
+        let data_ptr: *const u8 = signed_bytes.as_ptr();
+        let data_ptrs = [data_ptr];
+        let data_size: u32 = signed_bytes.len() as u32;
 
-    let mut sig_len: u32 = 0;
-    CryptSignMessage(
-        &sign_para,
-        BOOL(1),
-        1,
-        Some(data_ptrs.as_ptr()),
-        &data_size,
-        None,
-        &mut sig_len,
-    )
-    .context(
-        "CryptSignMessage (calcular tamanho) falhou - verifique PIN e conectividade do token",
-    )?;
+        let mut sig_len: u32 = 0;
+        CryptSignMessage(
+            &sign_para,
+            BOOL(1),
+            1,
+            Some(data_ptrs.as_ptr()),
+            &data_size,
+            None,
+            &mut sig_len,
+        )
+        .context(
+            "CryptSignMessage (calcular tamanho) falhou - verifique PIN e conectividade do token",
+        )?;
 
-    let mut sig = vec![0u8; sig_len as usize];
-    CryptSignMessage(
-        &sign_para,
-        BOOL(1),
-        1,
-        Some(data_ptrs.as_ptr()),
-        &data_size,
-        Some(sig.as_mut_ptr()),
-        &mut sig_len,
-    )
-    .context("CryptSignMessage (assinar) falhou")?;
+        let mut sig = vec![0u8; sig_len as usize];
+        CryptSignMessage(
+            &sign_para,
+            BOOL(1),
+            1,
+            Some(data_ptrs.as_ptr()),
+            &data_size,
+            Some(sig.as_mut_ptr()),
+            &mut sig_len,
+        )
+        .context("CryptSignMessage (assinar) falhou")?;
 
-    sig.truncate(sig_len as usize);
-    Ok(sig)
-}}
+        sig.truncate(sig_len as usize);
+        Ok(sig)
+    }
+}
 
 fn file_name(p: &Path) -> String {
     p.file_name()
@@ -1594,6 +1709,32 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::CertOverride;
+    use windows::Win32::Security::Cryptography::CERT_CONTEXT;
+
+    fn fake_cert(
+        subject: &str,
+        issuer: &str,
+        thumbprint: &str,
+        provider_name: &str,
+        is_hardware_token: bool,
+        valid_now: bool,
+        supports_digital_signature: bool,
+    ) -> OwnedCert {
+        OwnedCert {
+            subject: subject.to_string(),
+            issuer: issuer.to_string(),
+            thumbprint: normalize_thumbprint(thumbprint),
+            context: std::ptr::null::<CERT_CONTEXT>(),
+            valid_now,
+            supports_digital_signature,
+            key_provider_name: provider_name.to_string(),
+            key_container_name: String::new(),
+            key_provider_type: 0,
+            key_spec: 0,
+            is_hardware_token,
+        }
+    }
 
     #[test]
     fn computes_top_left_horizontal_rect() {
@@ -1697,5 +1838,103 @@ mod tests {
         assert!(!lines.is_empty());
         assert!(lines.len() <= 2);
         assert!(lines.iter().all(|line| line.chars().count() <= 24));
+    }
+
+    #[test]
+    fn certificate_summary_maps_expected_fields() {
+        let cert = fake_cert(
+            "CN=Alice",
+            "AC Demo",
+            "AA BB 11",
+            "Provider Demo",
+            true,
+            true,
+            true,
+        );
+        let summary = certificate_summary_from_owned(&cert, 2);
+
+        assert_eq!(summary.index, 3);
+        assert_eq!(summary.subject, "CN=Alice");
+        assert_eq!(summary.issuer, "AC Demo");
+        assert_eq!(summary.thumbprint, "AABB11");
+        assert_eq!(summary.provider_name, "Provider Demo");
+        assert!(summary.is_hardware_token);
+        assert!(summary.valid_now);
+        assert!(summary.supports_digital_signature);
+    }
+
+    #[test]
+    fn explicit_thumbprint_not_found_returns_error() {
+        let certs = vec![fake_cert(
+            "CN=Alice",
+            "AC Demo",
+            "AA BB CC",
+            "Provider Demo",
+            true,
+            true,
+            true,
+        )];
+        let cert_override = CertOverride::default();
+        let selection = CertSelectionRequest {
+            thumbprint: Some("FF EE DD".to_string()),
+            index: None,
+        };
+
+        let err = choose_certificate_index(&certs, &cert_override, Some(&selection), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cert_thumbprint"));
+        assert!(err.contains("nao encontrado"));
+    }
+
+    #[test]
+    fn explicit_index_out_of_range_returns_error() {
+        let certs = vec![fake_cert(
+            "CN=Alice",
+            "AC Demo",
+            "AA BB CC",
+            "Provider Demo",
+            true,
+            true,
+            true,
+        )];
+        let cert_override = CertOverride::default();
+        let selection = CertSelectionRequest {
+            thumbprint: None,
+            index: Some(2),
+        };
+
+        let err = choose_certificate_index(&certs, &cert_override, Some(&selection), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cert_index invalido"));
+    }
+
+    #[test]
+    fn token_only_blocks_non_hardware_even_with_explicit_selection() {
+        let certs = vec![fake_cert(
+            "CN=Alice",
+            "AC Demo",
+            "AA BB CC",
+            "Software Provider",
+            false,
+            true,
+            true,
+        )];
+        let cert_override = CertOverride {
+            mode: "token_only".to_string(),
+            thumbprint: None,
+            index: None,
+        };
+        let selection = CertSelectionRequest {
+            thumbprint: None,
+            index: Some(1),
+        };
+
+        let err = choose_certificate_index(&certs, &cert_override, Some(&selection), false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("token_only"));
+        assert!(err.contains("hardware token"));
     }
 }

@@ -192,8 +192,9 @@ http://127.0.0.1:45890/playground
 
 1. `auth`
 2. `ping`
-3. `sign_pdf`
-4. `sign_pdfs` (assinatura em lote)
+3. `list_certificates`
+4. `sign_pdf`
+5. `sign_pdfs` (assinatura em lote)
 
 ### Formato de requisicao
 
@@ -206,18 +207,47 @@ http://127.0.0.1:45890/playground
 ```
 
 ```json
-{"id":"3","action":"sign_pdf","payload":{"filename":"doc.pdf","pdf_base64":"..."}}
+{"id":"3","action":"list_certificates","payload":{}}
+```
+
+Resposta (sucesso):
+
+```json
+{
+  "id":"3",
+  "ok":true,
+  "result":{
+    "certificates":[
+      {
+        "index":1,
+        "subject":"...",
+        "issuer":"...",
+        "thumbprint":"...",
+        "is_hardware_token":true,
+        "provider_name":"...",
+        "valid_now":true,
+        "supports_digital_signature":true
+      }
+    ]
+  }
+}
+```
+
+```json
+{"id":"4","action":"sign_pdf","payload":{"filename":"doc.pdf","pdf_base64":"...","cert_thumbprint":"...","cert_index":1}}
 ```
 
 Com assinatura visivel opcional na primeira pagina:
 
 ```json
 {
-  "id":"3",
+  "id":"4",
   "action":"sign_pdf",
   "payload":{
     "filename":"doc.pdf",
     "pdf_base64":"...",
+    "cert_thumbprint":"...",
+    "cert_index":1,
     "visible_signature":{
       "placement":"top_left_horizontal",
       "style":"default",
@@ -259,14 +289,19 @@ Observacoes:
 - `timezone` e opcional e usa `local` quando ausente.
 - Quando ausente, a assinatura continua invisivel (comportamento legado).
 - Quando presente, a assinatura visivel e aplicada apenas na primeira pagina.
+- `cert_thumbprint` e `cert_index` sao opcionais e valem so para a request atual.
+- Se ambos forem enviados, `cert_thumbprint` tem prioridade.
+- Sem seletor na request, o app usa o fluxo atual (`cert_override` + fallback automatico).
 
 #### Assinatura em lote (`sign_pdfs`)
 
 ```json
 {
-  "id":"4",
+  "id":"5",
   "action":"sign_pdfs",
   "payload":{
+    "cert_thumbprint":"...",
+    "cert_index":1,
     "files":[
       {"filename":"doc1.pdf","pdf_base64":"...","visible_signature":{"placement":"top_left_horizontal"}},
       {"filename":"doc2.pdf","pdf_base64":"..."}
@@ -279,7 +314,7 @@ Resposta (sucesso):
 
 ```json
 {
-  "id":"4",
+  "id":"5",
   "ok":true,
   "result":{
     "files":[
@@ -337,7 +372,12 @@ Use o endpoint HTTP local para testar o protocolo sem app web externa:
 2. Abra `http://127.0.0.1:45890/playground` no navegador.
 3. Clique em `Conectar`.
 4. Clique em `Autenticar` (token predefinido para dev: `troque-este-token`).
-5. Teste `Ping` e `Assinar PDF`.
+5. Clique em `Listar certificados` e selecione um certificado (ou deixe em automatico).
+6. Teste `Ping`, `Assinar PDF` e `Assinar PDFs (lote)`.
+
+Observacao:
+
+- O playground lembra o ultimo certificado selecionado no navegador (localStorage) e tenta restaurar quando a lista for carregada novamente.
 
 Observacao importante:
 
@@ -349,8 +389,15 @@ Observacao importante:
 1. Inicie o app sem argumentos.
 2. Clique direito no icone da bandeja.
 3. Clique em `Abrir playground` para abrir `http://127.0.0.1:45890/playground` no navegador; ou clique em `Assinar documento`.
-4. Selecione um ou mais PDFs.
-5. Arquivos assinados sao gravados como `*_assinado.pdf` no mesmo diretorio.
+4. No dialogo de assinatura, escolha o certificado no dropdown (pre-selecionado pelo algoritmo atual) ou mantenha `automatico (algoritmo atual)`.
+5. Opcionalmente, marque `Assinatura visivel` e escolha a posicao (padrao: `bottom_center_horizontal`).
+6. Selecione um ou mais PDFs.
+7. Arquivos assinados sao gravados como `*_assinado.pdf` no mesmo diretorio.
+
+Observacao:
+
+- O dialogo da bandeja inclui checkbox de assinatura visivel e lista de posicoes suportadas.
+- A cada assinatura, voce pode trocar certificado/posicao no proprio dialogo, sem reiniciar o app.
 
 ## Auto-start no Windows
 

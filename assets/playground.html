@@ -226,6 +226,21 @@
               </select>
             </div>
           </div>
+          <div class="row">
+            <div>
+              <label for="certSelect">Certificado para assinatura</label>
+              <select id="certSelect">
+                <option value="">automatico (config/fallback)</option>
+              </select>
+            </div>
+            <div>
+              <label>&nbsp;</label>
+              <div class="actions" style="margin-top:0">
+                <button id="btnListCerts" class="secondary" disabled>Listar certificados</button>
+              </div>
+              <p id="certSummary" class="subtitle" style="margin-top:8px">Nenhum certificado carregado no playground.</p>
+            </div>
+          </div>
           <div class="actions">
             <button id="btnSign" disabled>Assinar PDF</button>
             <button id="btnSignBatch" disabled>Assinar PDFs (lote)</button>
@@ -263,6 +278,8 @@
     const tokenInput = document.getElementById("token");
     const filePdfInput = document.getElementById("filePdf");
     const visiblePlacementInput = document.getElementById("visiblePlacement");
+    const certSelectInput = document.getElementById("certSelect");
+    const certSummary = document.getElementById("certSummary");
     const statusEl = document.getElementById("status");
     const logEl = document.getElementById("log");
     const pdfViewer = document.getElementById("pdfViewer");
@@ -275,17 +292,22 @@
     const btnPing = document.getElementById("btnPing");
     const btnSign = document.getElementById("btnSign");
     const btnSignBatch = document.getElementById("btnSignBatch");
+    const btnListCerts = document.getElementById("btnListCerts");
     const btnDownload = document.getElementById("btnDownload");
     const btnDownloadAll = document.getElementById("btnDownloadAll");
 
     const defaultWs = `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`;
+    const certStorageThumbprintKey = "assinador.playground.cert.thumbprint";
+    const certStorageIndexKey = "assinador.playground.cert.index";
     wsUrlInput.value = defaultWs;
 
     let ws = null;
     let counter = 1;
     let pendingSignReqId = null;
     let pendingBatchReqId = null;
+    let pendingListCertReqId = null;
     let isAuthenticated = false;
+    let listedCertificates = [];
 
     // Tab state
     let signedTabs = [];       // [{filename, ok, blobUrl, error}]
@@ -333,17 +355,143 @@
       return clone;
     }
 
+    function truncateText(text, maxLen) {
+      if (typeof text !== "string") return "";
+      return text.length > maxLen ? `${text.slice(0, maxLen - 1)}...` : text;
+    }
+
+    function loadStoredCertSelection() {
+      try {
+        const thumbprint = localStorage.getItem(certStorageThumbprintKey) || "";
+        const indexRaw = localStorage.getItem(certStorageIndexKey) || "";
+        const index = Number(indexRaw);
+        return {
+          thumbprint,
+          index: Number.isInteger(index) && index > 0 ? index : null
+        };
+      } catch (_) {
+        return { thumbprint: "", index: null };
+      }
+    }
+
+    function persistSelectedCertSelection() {
+      if (!listedCertificates.length) return;
+      const selected = certSelectInput.options[certSelectInput.selectedIndex];
+      try {
+        if (!selected || !selected.value) {
+          localStorage.setItem(certStorageThumbprintKey, "");
+          localStorage.removeItem(certStorageIndexKey);
+          return;
+        }
+        localStorage.setItem(certStorageThumbprintKey, selected.value);
+        if (selected.dataset.index) {
+          localStorage.setItem(certStorageIndexKey, selected.dataset.index);
+        } else {
+          localStorage.removeItem(certStorageIndexKey);
+        }
+      } catch (_) {
+        // ignore localStorage failures
+      }
+    }
+
+    function selectedCertPayload() {
+      const selected = certSelectInput.options[certSelectInput.selectedIndex];
+      if (!selected || !selected.value) {
+        return null;
+      }
+
+      const certIndex = Number(selected.dataset.index || "0");
+      const payload = { cert_thumbprint: selected.value };
+      if (Number.isInteger(certIndex) && certIndex > 0) {
+        payload.cert_index = certIndex;
+      }
+      return payload;
+    }
+
+    function updateCertSummary(persistSelection) {
+      const selected = certSelectInput.options[certSelectInput.selectedIndex];
+      if (!selected || !selected.value) {
+        certSummary.textContent = listedCertificates.length > 0
+          ? "Selecao automatica ativa (config/fallback)."
+          : "Nenhum certificado carregado no playground.";
+        if (persistSelection) persistSelectedCertSelection();
+        return;
+      }
+
+      const certIndex = Number(selected.dataset.index || "0");
+      const cert = listedCertificates.find(item => item.index === certIndex);
+      if (!cert) {
+        certSummary.textContent = "Certificado selecionado no playground.";
+        if (persistSelection) persistSelectedCertSelection();
+        return;
+      }
+
+      const token = cert.is_hardware_token ? "sim" : "nao";
+      const valid = cert.valid_now ? "sim" : "nao";
+      certSummary.textContent =
+        `Selecionado [${cert.index}] ${truncateText(cert.subject || "(sem subject)", 72)} | token: ${token} | valido agora: ${valid}.`;
+      if (persistSelection) persistSelectedCertSelection();
+    }
+
+    function setCertificateOptions(certs) {
+      listedCertificates = Array.isArray(certs) ? certs : [];
+      certSelectInput.innerHTML = "";
+
+      const autoOpt = document.createElement("option");
+      autoOpt.value = "";
+      autoOpt.textContent = "automatico (config/fallback)";
+      certSelectInput.appendChild(autoOpt);
+
+      for (const cert of listedCertificates) {
+        const opt = document.createElement("option");
+        opt.value = typeof cert.thumbprint === "string" ? cert.thumbprint : "";
+        opt.dataset.index = String(cert.index || "");
+        const tokenLabel = cert.is_hardware_token ? "A3/token" : "software";
+        const subject = truncateText(cert.subject || "(sem subject)", 40);
+        const provider = truncateText(cert.provider_name || "(sem provider)", 28);
+        opt.textContent = `[${cert.index}] ${subject} | ${tokenLabel} | ${provider}`;
+        certSelectInput.appendChild(opt);
+      }
+
+      const stored = loadStoredCertSelection();
+      let selectedIdx = 0;
+      if (stored.thumbprint) {
+        const exactMatch = Array.from(certSelectInput.options).findIndex(opt => {
+          const optIndex = Number(opt.dataset.index || "0");
+          if (stored.index && optIndex > 0) {
+            return opt.value === stored.thumbprint && optIndex === stored.index;
+          }
+          return opt.value === stored.thumbprint;
+        });
+        if (exactMatch > 0) {
+          selectedIdx = exactMatch;
+        } else {
+          const thumbOnlyMatch = Array.from(certSelectInput.options).findIndex(
+            opt => opt.value === stored.thumbprint
+          );
+          if (thumbOnlyMatch > 0) {
+            selectedIdx = thumbOnlyMatch;
+          }
+        }
+      }
+
+      certSelectInput.selectedIndex = selectedIdx;
+      updateCertSummary(false);
+    }
+
     function updateButtons() {
       const connected = ws && ws.readyState === WebSocket.OPEN;
       const fileCount = filePdfInput.files ? filePdfInput.files.length : 0;
       btnConnect.disabled = connected;
       btnDisconnect.disabled = !connected;
       btnPing.disabled = !connected || !isAuthenticated;
+      btnListCerts.disabled = !connected || !isAuthenticated;
       btnSign.disabled = !connected || !isAuthenticated || fileCount !== 1;
       btnSignBatch.disabled = !connected || !isAuthenticated || fileCount < 1;
     }
 
     filePdfInput.addEventListener("change", updateButtons);
+    certSelectInput.addEventListener("change", () => updateCertSummary(true));
 
     function sendJson(obj) {
       if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -493,8 +641,10 @@
 
       ws.onclose = (evt) => {
         isAuthenticated = false;
+        pendingListCertReqId = null;
         setStatus(`Desconectado (code=${evt.code})`, "");
         appendLog("LOCAL", `Socket fechado (code=${evt.code}, reason=${evt.reason || ""})`);
+        setCertificateOptions([]);
         updateButtons();
       };
 
@@ -524,6 +674,31 @@
           isAuthenticated = true;
           setStatus("Autenticado com sucesso.", "ok");
           updateButtons();
+          requestCertificateList();
+        }
+
+        // list_certificates response
+        if (
+          pendingListCertReqId &&
+          parsed &&
+          parsed.id === pendingListCertReqId
+        ) {
+          pendingListCertReqId = null;
+          if (
+            parsed.ok === true &&
+            parsed.result &&
+            Array.isArray(parsed.result.certificates)
+          ) {
+            setCertificateOptions(parsed.result.certificates);
+            setStatus(
+              `Certificados carregados: ${parsed.result.certificates.length}.`,
+              "ok"
+            );
+          } else if (parsed.ok === false) {
+            const message = parsed.error ? parsed.error.message : "desconhecido";
+            setStatus(`Erro ao listar certificados: ${message}`, "err");
+            setCertificateOptions([]);
+          }
         }
 
         // single sign_pdf response
@@ -602,6 +777,16 @@
       );
     }
 
+    function requestCertificateList() {
+      const id = nextId();
+      pendingListCertReqId = id;
+      sendJson({
+        id,
+        action: "list_certificates",
+        payload: {}
+      });
+    }
+
     btnDisconnect.addEventListener("click", () => {
       if (ws) {
         ws.close();
@@ -611,6 +796,10 @@
     btnPing.addEventListener("click", () => {
       const id = nextId();
       sendJson({ id, action: "ping", payload: {} });
+    });
+
+    btnListCerts.addEventListener("click", () => {
+      requestCertificateList();
     });
 
     // Single sign_pdf
@@ -629,6 +818,10 @@
         filename: file.name,
         pdf_base64: base64
       };
+      const certSelection = selectedCertPayload();
+      if (certSelection) {
+        Object.assign(payload, certSelection);
+      }
       const placement = visiblePlacementInput.value;
       if (placement) {
         payload.visible_signature = { placement };
@@ -667,10 +860,16 @@
         files.push(entry);
       }
 
+      const payload = { files };
+      const certSelection = selectedCertPayload();
+      if (certSelection) {
+        Object.assign(payload, certSelection);
+      }
+
       sendJson({
         id,
         action: "sign_pdfs",
-        payload: { files }
+        payload
       });
       setStatus(`Pedido de assinatura em lote enviado (${files.length} arquivo(s)).`, "");
     });

@@ -1,26 +1,26 @@
 use crate::{app::SharedState, logger, signer};
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     convert::Infallible,
     net::SocketAddr,
-    sync::{mpsc, Arc},
+    sync::{Arc, mpsc},
     thread,
     time::Duration,
 };
 use tokio::{
     sync::oneshot,
-    time::{timeout, Instant},
+    time::{Instant, timeout},
 };
 use uuid::Uuid;
 use warp::{
+    Filter, Reply,
     filters::path::FullPath,
     http::StatusCode,
     ws::{Message, WebSocket, Ws},
-    Filter, Reply,
 };
 
 const MAX_BASE64_SIZE: usize = 20 * 1024 * 1024;
@@ -305,6 +305,14 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
             "ping" => {
                 send_ok(&mut sink, req.id, json!({"pong": true})).await?;
             }
+            "list_certificates" => match signer::list_available_certificates() {
+                Ok(certs) => {
+                    send_ok(&mut sink, req.id, json!({ "certificates": certs })).await?;
+                }
+                Err(err) => {
+                    send_error(&mut sink, req.id, "SIGNING_FAILED", &format!("{err:#}")).await?;
+                }
+            },
             "sign_pdf" => match handle_sign_pdf(req.payload, state.clone()).await {
                 Ok(result) => {
                     send_ok(
@@ -384,6 +392,8 @@ async fn handle_sign_pdf(
     let pdf_bytes = STANDARD
         .decode(payload.pdf_base64.as_bytes())
         .map_err(|_| WsActionError::Invalid("pdf_base64 invalido".to_string()))?;
+    let cert_selection =
+        parse_cert_selection(payload.cert_thumbprint.as_deref(), payload.cert_index)?;
 
     let permit = state
         .signing_gate
@@ -395,10 +405,17 @@ async fn handle_sign_pdf(
     let cert_override = state.config.cert_override.clone();
     let verbose = state.verbose;
     let visible_signature = payload.visible_signature.clone();
+    let has_explicit_cert_selection = cert_selection.is_some();
     let started = Instant::now();
 
     let signing_task = tokio::task::spawn_blocking(move || {
-        signer::sign_single_pdf_bytes(&pdf_bytes, &cert_override, verbose, visible_signature)
+        signer::sign_single_pdf_bytes(
+            &pdf_bytes,
+            &cert_override,
+            verbose,
+            visible_signature,
+            cert_selection,
+        )
     });
     let (result_tx, result_rx) =
         oneshot::channel::<std::result::Result<signer::WsSignResult, WsActionError>>();
@@ -407,7 +424,9 @@ async fn handle_sign_pdf(
         let outcome = signing_task
             .await
             .map_err(|err| WsActionError::Signing(format!("Task de assinatura falhou: {err:#}")))
-            .and_then(|res| res.map_err(|err| WsActionError::Signing(format!("{err:#}"))));
+            .and_then(|res| {
+                res.map_err(|err| classify_signer_error(err, has_explicit_cert_selection))
+            });
         let _ = result_tx.send(outcome);
         drop(permit);
     });
@@ -435,8 +454,12 @@ async fn handle_sign_pdfs(
         .map_err(|_| WsActionError::Invalid("Payload sign_pdfs invalido".to_string()))?;
 
     if payload.files.is_empty() {
-        return Err(WsActionError::Invalid("Lista de arquivos vazia".to_string()));
+        return Err(WsActionError::Invalid(
+            "Lista de arquivos vazia".to_string(),
+        ));
     }
+    let cert_selection =
+        parse_cert_selection(payload.cert_thumbprint.as_deref(), payload.cert_index)?;
 
     let mut inputs = Vec::with_capacity(payload.files.len());
     for entry in &payload.files {
@@ -448,14 +471,12 @@ async fn handle_sign_pdfs(
             )));
         }
 
-        let pdf_bytes = STANDARD
-            .decode(entry.pdf_base64.as_bytes())
-            .map_err(|_| {
-                WsActionError::Invalid(format!(
-                    "pdf_base64 invalido no arquivo '{}'",
-                    entry.filename.as_deref().unwrap_or("?")
-                ))
-            })?;
+        let pdf_bytes = STANDARD.decode(entry.pdf_base64.as_bytes()).map_err(|_| {
+            WsActionError::Invalid(format!(
+                "pdf_base64 invalido no arquivo '{}'",
+                entry.filename.as_deref().unwrap_or("?")
+            ))
+        })?;
 
         inputs.push(signer::BatchFileInput {
             filename: entry.filename.clone().unwrap_or_default(),
@@ -477,10 +498,11 @@ async fn handle_sign_pdfs(
 
     let cert_override = state.config.cert_override.clone();
     let verbose = state.verbose;
+    let has_explicit_cert_selection = cert_selection.is_some();
     let started = Instant::now();
 
     let signing_task = tokio::task::spawn_blocking(move || {
-        signer::sign_batch_pdf_bytes(inputs, &cert_override, verbose)
+        signer::sign_batch_pdf_bytes(inputs, &cert_override, verbose, cert_selection)
     });
     let (result_tx, result_rx) =
         oneshot::channel::<std::result::Result<signer::BatchSignResult, WsActionError>>();
@@ -489,7 +511,9 @@ async fn handle_sign_pdfs(
         let outcome = signing_task
             .await
             .map_err(|err| WsActionError::Signing(format!("Task de assinatura falhou: {err:#}")))
-            .and_then(|res| res.map_err(|err| WsActionError::Signing(format!("{err:#}"))));
+            .and_then(|res| {
+                res.map_err(|err| classify_signer_error(err, has_explicit_cert_selection))
+            });
         let _ = result_tx.send(outcome);
         drop(permit);
     });
@@ -542,6 +566,53 @@ async fn handle_sign_pdfs(
         "cert_is_hardware_token": batch_result.cert_is_hardware_token,
         "cert_provider_name": batch_result.cert_provider_name,
     }))
+}
+
+fn parse_cert_selection(
+    cert_thumbprint: Option<&str>,
+    cert_index: Option<usize>,
+) -> std::result::Result<Option<signer::CertSelectionRequest>, WsActionError> {
+    if let Some(index) = cert_index {
+        if index == 0 {
+            return Err(WsActionError::Invalid(
+                "cert_index invalido: valores aceitos comecam em 1".to_string(),
+            ));
+        }
+    }
+
+    let thumbprint = match cert_thumbprint {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(WsActionError::Invalid(
+                    "cert_thumbprint invalido: nao pode ser vazio".to_string(),
+                ));
+            }
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
+
+    if thumbprint.is_none() && cert_index.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(signer::CertSelectionRequest {
+        thumbprint,
+        index: cert_index,
+    }))
+}
+
+fn classify_signer_error(err: anyhow::Error, has_explicit_cert_selection: bool) -> WsActionError {
+    let msg = format!("{err:#}");
+    if has_explicit_cert_selection
+        && (msg.contains("cert_thumbprint")
+            || msg.contains("cert_index")
+            || msg.contains("O certificado selecionado nao parece hardware token"))
+    {
+        return WsActionError::Invalid(msg);
+    }
+    WsActionError::Signing(msg)
 }
 
 fn parse_request_message(message: Message) -> Result<ClientRequest> {
@@ -674,11 +745,15 @@ struct SignPdfPayload {
     filename: Option<String>,
     pdf_base64: String,
     visible_signature: Option<signer::VisibleSignatureRequest>,
+    cert_thumbprint: Option<String>,
+    cert_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SignPdfsPayload {
     files: Vec<SignPdfFileEntry>,
+    cert_thumbprint: Option<String>,
+    cert_index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,6 +783,7 @@ struct ErrorBody {
     message: String,
 }
 
+#[derive(Debug)]
 enum WsActionError {
     Busy,
     Invalid(String),
@@ -800,5 +876,45 @@ mod tests {
             }
         }));
         assert!(payload.is_err());
+    }
+
+    #[test]
+    fn sign_pdf_payload_accepts_cert_thumbprint() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "cert_thumbprint": "AA BB CC"
+        }))
+        .unwrap();
+        assert_eq!(payload.cert_thumbprint.as_deref(), Some("AA BB CC"));
+    }
+
+    #[test]
+    fn sign_pdf_payload_accepts_cert_index() {
+        let payload = serde_json::from_value::<SignPdfPayload>(json!({
+            "filename": "arquivo.pdf",
+            "pdf_base64": "YWJj",
+            "cert_index": 2
+        }))
+        .unwrap();
+        assert_eq!(payload.cert_index, Some(2));
+    }
+
+    #[test]
+    fn cert_selection_prioritizes_thumbprint_over_index() {
+        let selection = parse_cert_selection(Some("A1 B2 C3"), Some(3))
+            .unwrap()
+            .unwrap();
+        assert_eq!(selection.thumbprint.as_deref(), Some("A1 B2 C3"));
+        assert_eq!(selection.index, Some(3));
+    }
+
+    #[test]
+    fn cert_selection_rejects_zero_index() {
+        let err = parse_cert_selection(None, Some(0)).unwrap_err();
+        match err {
+            WsActionError::Invalid(msg) => assert!(msg.contains("cert_index invalido")),
+            _ => panic!("erro inesperado"),
+        }
     }
 }
