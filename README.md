@@ -108,6 +108,7 @@ Workflow: `.github/workflows/release-msix.yml`
 Configure em `Settings -> Secrets and variables -> Actions -> Variables`:
 
 - `MSIX_IDENTITY_NAME`
+- `MSIX_DISPLAY_NAME`
 - `MSIX_PUBLISHER`
 - `MSIX_PUBLISHER_DISPLAY_NAME` (deve bater com o display name do publisher no Partner Center, ex.: `celsowm`)
 

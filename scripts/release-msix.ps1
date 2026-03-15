@@ -3,8 +3,8 @@ param(
   [string]$IdentityName,
   [Parameter(Mandatory = $true)]
   [string]$Publisher,
-  [Parameter(Mandatory = $false)]
-[string]$DisplayName = "Assinador Livre RS",
+[Parameter(Mandatory = $false)]
+  [string]$DisplayName = "assinador-livre-rs",
   [Parameter(Mandatory = $false)]
   [string]$PublisherDisplayName = "celsowm",
   [Parameter(Mandatory = $false)]
