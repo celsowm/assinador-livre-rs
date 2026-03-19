@@ -8,6 +8,10 @@ const CONFIG_FILE_NAME: &str = "config.json";
 const LOG_DIR_NAME: &str = "logs";
 const LOG_FILE_NAME: &str = "assinador.log";
 
+fn default_startup_with_os_login() -> bool {
+    true
+}
+
 #[derive(Debug, Clone)]
 pub struct AppPaths {
     pub base_dir: PathBuf,
@@ -31,7 +35,11 @@ pub struct AppConfig {
     pub ws_token: String,
     pub allowed_origins: Vec<String>,
     pub cert_override: CertOverride,
-    pub startup_with_windows: bool,
+    #[serde(
+        default = "default_startup_with_os_login",
+        alias = "startup_with_windows"
+    )]
+    pub startup_with_os_login: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,7 +72,7 @@ impl Default for AppConfig {
                 "https://seu-dominio.com".to_string(),
             ],
             cert_override: CertOverride::default(),
-            startup_with_windows: true,
+            startup_with_os_login: default_startup_with_os_login(),
         }
     }
 }

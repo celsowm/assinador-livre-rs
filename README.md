@@ -1,4 +1,4 @@
-# Assinador Livre RS (Windows)
+# Assinador Livre RS (Windows, preparando macOS/Linux)
 
 Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via Windows Certificate Store.
 
@@ -155,9 +155,14 @@ Exemplo:
     "thumbprint": null,
     "index": null
   },
-  "startup_with_windows": true
+  "startup_with_os_login": true
 }
 ```
+
+Compatibilidade:
+
+- `startup_with_windows` ainda e aceito na leitura (legado).
+- Ao normalizar/salvar configuracao, o app persiste `startup_with_os_login`.
 
 ### Regras de certificado (`cert_override`)
 
@@ -357,6 +362,7 @@ Observacoes:
 - `INVALID_REQUEST`
 - `SIGNING_FAILED`
 - `BUSY`
+- `SIGNING_BACKEND_UNAVAILABLE` (quando executado fora do Windows nesta fase)
 
 ### Limites operacionais
 
@@ -401,7 +407,7 @@ Observacao:
 
 ## Auto-start no Windows
 
-Quando `startup_with_windows=true`, o app garante entrada em:
+Quando `startup_with_os_login=true`, o app garante entrada em:
 
 ```text
 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run

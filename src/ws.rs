@@ -1,4 +1,8 @@
-use crate::{app::SharedState, logger, signer};
+use crate::{
+    application::{AppService, AppServiceError},
+    contracts::{self, BatchFileInput, CertSelectionRequest, VisibleSignatureRequest},
+    logger,
+};
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
@@ -44,7 +48,7 @@ impl WsServerHandle {
     }
 }
 
-pub fn spawn_server(state: Arc<SharedState>) -> Result<WsServerHandle> {
+pub fn spawn_server(service: Arc<AppService>) -> Result<WsServerHandle> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let (ready_tx, ready_rx) = mpsc::channel::<std::result::Result<(), String>>();
 
@@ -61,7 +65,7 @@ pub fn spawn_server(state: Arc<SharedState>) -> Result<WsServerHandle> {
             }
         };
 
-        if let Err(e) = rt.block_on(run_server(state, shutdown_rx, ready_tx)) {
+        if let Err(e) = rt.block_on(run_server(service, shutdown_rx, ready_tx)) {
             logger::error(format!("Servidor WS encerrado com erro: {e:#}"));
         }
     });
@@ -85,11 +89,11 @@ pub fn spawn_server(state: Arc<SharedState>) -> Result<WsServerHandle> {
 }
 
 async fn run_server(
-    state: Arc<SharedState>,
+    service: Arc<AppService>,
     shutdown_rx: oneshot::Receiver<()>,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) -> Result<()> {
-    let bind_addr = format!("{}:{}", state.config.ws_host, state.config.ws_port);
+    let bind_addr = format!("{}:{}", service.config.ws_host, service.config.ws_port);
     let socket_addr: SocketAddr = match bind_addr.parse() {
         Ok(addr) => addr,
         Err(err) => {
@@ -99,9 +103,9 @@ async fn run_server(
         }
     };
 
-    let expected_path = state.config.normalized_ws_path();
-    let allowed_origins = state.config.normalized_allowed_origins();
-    let local_origins = default_local_origins(&state.config.ws_host, state.config.ws_port);
+    let expected_path = service.config.normalized_ws_path();
+    let allowed_origins = service.config.normalized_allowed_origins();
+    let local_origins = default_local_origins(&service.config.ws_host, service.config.ws_port);
 
     let playground_route = warp::path("playground")
         .and(warp::path::end())
@@ -121,7 +125,7 @@ async fn run_server(
     let ws_route = warp::path::full()
         .and(warp::ws())
         .and(warp::header::optional::<String>("origin"))
-        .and(with_state(state.clone()))
+        .and(with_service(service.clone()))
         .and(with_expected_path(expected_path.clone()))
         .and(with_allowed_origins(allowed_origins.clone()))
         .and(with_local_origins(local_origins.clone()))
@@ -129,7 +133,7 @@ async fn run_server(
             |full: FullPath,
              ws: Ws,
              origin: Option<String>,
-             state: Arc<SharedState>,
+             service: Arc<AppService>,
              expected_path: String,
              allowed_origins: Vec<String>,
              local_origins: Vec<String>| async move {
@@ -137,7 +141,7 @@ async fn run_server(
                     full,
                     ws,
                     origin,
-                    state,
+                    service,
                     expected_path,
                     allowed_origins,
                     local_origins,
@@ -161,8 +165,8 @@ async fn run_server(
     let _ = ready_tx.send(Ok(()));
     logger::info(format!(
         "Servidor local ouvindo em ws://{}:{}{} e http://{}:{}/playground",
-        state.config.ws_host,
-        state.config.ws_port,
+        service.config.ws_host,
+        service.config.ws_port,
         expected_path,
         server_addr.ip(),
         server_addr.port()
@@ -176,7 +180,7 @@ async fn route_ws(
     full: FullPath,
     ws: Ws,
     origin: Option<String>,
-    state: Arc<SharedState>,
+    service: Arc<AppService>,
     expected_path: String,
     allowed_origins: Vec<String>,
     local_origins: Vec<String>,
@@ -203,7 +207,7 @@ async fn route_ws(
         .max_message_size(22 * 1024 * 1024)
         .max_frame_size(22 * 1024 * 1024)
         .on_upgrade(move |socket| async move {
-            if let Err(err) = handle_socket(socket, state).await {
+            if let Err(err) = handle_socket(socket, service).await {
                 logger::warn(format!("Conexao WS encerrada com erro: {err:#}"));
             }
         })
@@ -212,7 +216,7 @@ async fn route_ws(
     Ok(response)
 }
 
-async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
+async fn handle_socket(ws: WebSocket, service: Arc<AppService>) -> Result<()> {
     logger::info("Cliente WS conectado");
 
     let (mut sink, mut stream) = ws.split();
@@ -275,7 +279,7 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
         }
     };
 
-    if auth_payload.token != state.config.ws_token {
+    if auth_payload.token != service.config.ws_token {
         send_error(&mut sink, auth_req.id, "AUTH_FAILED", "Token invalido").await?;
         let _ = sink.close().await;
         return Ok(());
@@ -305,15 +309,30 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
             "ping" => {
                 send_ok(&mut sink, req.id, json!({"pong": true})).await?;
             }
-            "list_certificates" => match signer::list_available_certificates() {
+            "list_certificates" => match service.list_certificates() {
                 Ok(certs) => {
                     send_ok(&mut sink, req.id, json!({ "certificates": certs })).await?;
                 }
+                Err(AppServiceError::BackendUnavailable(msg)) => {
+                    send_error(
+                        &mut sink,
+                        req.id,
+                        contracts::SIGNING_BACKEND_UNAVAILABLE,
+                        &msg,
+                    )
+                    .await?;
+                }
                 Err(err) => {
-                    send_error(&mut sink, req.id, "SIGNING_FAILED", &format!("{err:#}")).await?;
+                    send_error(
+                        &mut sink,
+                        req.id,
+                        "SIGNING_FAILED",
+                        &format_service_error(&err),
+                    )
+                    .await?;
                 }
             },
-            "sign_pdf" => match handle_sign_pdf(req.payload, state.clone()).await {
+            "sign_pdf" => match handle_sign_pdf(req.payload, service.clone()).await {
                 Ok(result) => {
                     send_ok(
                         &mut sink,
@@ -344,8 +363,17 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
                 Err(WsActionError::Signing(msg)) => {
                     send_error(&mut sink, req.id, "SIGNING_FAILED", &msg).await?;
                 }
+                Err(WsActionError::BackendUnavailable(msg)) => {
+                    send_error(
+                        &mut sink,
+                        req.id,
+                        contracts::SIGNING_BACKEND_UNAVAILABLE,
+                        &msg,
+                    )
+                    .await?;
+                }
             },
-            "sign_pdfs" => match handle_sign_pdfs(req.payload, state.clone()).await {
+            "sign_pdfs" => match handle_sign_pdfs(req.payload, service.clone()).await {
                 Ok(result) => {
                     send_ok(&mut sink, req.id, result).await?;
                 }
@@ -364,6 +392,15 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
                 Err(WsActionError::Signing(msg)) => {
                     send_error(&mut sink, req.id, "SIGNING_FAILED", &msg).await?;
                 }
+                Err(WsActionError::BackendUnavailable(msg)) => {
+                    send_error(
+                        &mut sink,
+                        req.id,
+                        contracts::SIGNING_BACKEND_UNAVAILABLE,
+                        &msg,
+                    )
+                    .await?;
+                }
             },
             _ => {
                 send_error(&mut sink, req.id, "INVALID_REQUEST", "Action nao suportada").await?;
@@ -377,8 +414,8 @@ async fn handle_socket(ws: WebSocket, state: Arc<SharedState>) -> Result<()> {
 
 async fn handle_sign_pdf(
     payload: Value,
-    state: Arc<SharedState>,
-) -> std::result::Result<signer::WsSignResult, WsActionError> {
+    service: Arc<AppService>,
+) -> std::result::Result<contracts::WsSignResult, WsActionError> {
     let payload: SignPdfPayload = serde_json::from_value(payload)
         .map_err(|_| WsActionError::Invalid("Payload sign_pdf invalido".to_string()))?;
 
@@ -395,38 +432,28 @@ async fn handle_sign_pdf(
     let cert_selection =
         parse_cert_selection(payload.cert_thumbprint.as_deref(), payload.cert_index)?;
 
-    let permit = state
+    let permit = service
         .signing_gate
         .clone()
         .try_acquire_owned()
         .map_err(|_| WsActionError::Busy)?;
 
     logger::info("Assinatura iniciada via WebSocket");
-    let cert_override = state.config.cert_override.clone();
-    let verbose = state.verbose;
     let visible_signature = payload.visible_signature.clone();
-    let has_explicit_cert_selection = cert_selection.is_some();
     let started = Instant::now();
 
+    let service_for_task = service.clone();
     let signing_task = tokio::task::spawn_blocking(move || {
-        signer::sign_single_pdf_bytes(
-            &pdf_bytes,
-            &cert_override,
-            verbose,
-            visible_signature,
-            cert_selection,
-        )
+        service_for_task.sign_single_pdf(&pdf_bytes, visible_signature, cert_selection)
     });
     let (result_tx, result_rx) =
-        oneshot::channel::<std::result::Result<signer::WsSignResult, WsActionError>>();
+        oneshot::channel::<std::result::Result<contracts::WsSignResult, WsActionError>>();
 
     tokio::spawn(async move {
         let outcome = signing_task
             .await
             .map_err(|err| WsActionError::Signing(format!("Task de assinatura falhou: {err:#}")))
-            .and_then(|res| {
-                res.map_err(|err| classify_signer_error(err, has_explicit_cert_selection))
-            });
+            .and_then(|res| res.map_err(map_service_error));
         let _ = result_tx.send(outcome);
         drop(permit);
     });
@@ -448,7 +475,7 @@ async fn handle_sign_pdf(
 
 async fn handle_sign_pdfs(
     payload: Value,
-    state: Arc<SharedState>,
+    service: Arc<AppService>,
 ) -> std::result::Result<Value, WsActionError> {
     let payload: SignPdfsPayload = serde_json::from_value(payload)
         .map_err(|_| WsActionError::Invalid("Payload sign_pdfs invalido".to_string()))?;
@@ -478,14 +505,14 @@ async fn handle_sign_pdfs(
             ))
         })?;
 
-        inputs.push(signer::BatchFileInput {
+        inputs.push(BatchFileInput {
             filename: entry.filename.clone().unwrap_or_default(),
             pdf_bytes,
             visible_signature: entry.visible_signature.clone(),
         });
     }
 
-    let permit = state
+    let permit = service
         .signing_gate
         .clone()
         .try_acquire_owned()
@@ -496,24 +523,20 @@ async fn handle_sign_pdfs(
         inputs.len()
     ));
 
-    let cert_override = state.config.cert_override.clone();
-    let verbose = state.verbose;
-    let has_explicit_cert_selection = cert_selection.is_some();
     let started = Instant::now();
 
+    let service_for_task = service.clone();
     let signing_task = tokio::task::spawn_blocking(move || {
-        signer::sign_batch_pdf_bytes(inputs, &cert_override, verbose, cert_selection)
+        service_for_task.sign_batch_pdfs(inputs, cert_selection)
     });
     let (result_tx, result_rx) =
-        oneshot::channel::<std::result::Result<signer::BatchSignResult, WsActionError>>();
+        oneshot::channel::<std::result::Result<crate::contracts::BatchSignResult, WsActionError>>();
 
     tokio::spawn(async move {
         let outcome = signing_task
             .await
             .map_err(|err| WsActionError::Signing(format!("Task de assinatura falhou: {err:#}")))
-            .and_then(|res| {
-                res.map_err(|err| classify_signer_error(err, has_explicit_cert_selection))
-            });
+            .and_then(|res| res.map_err(map_service_error));
         let _ = result_tx.send(outcome);
         drop(permit);
     });
@@ -571,7 +594,7 @@ async fn handle_sign_pdfs(
 fn parse_cert_selection(
     cert_thumbprint: Option<&str>,
     cert_index: Option<usize>,
-) -> std::result::Result<Option<signer::CertSelectionRequest>, WsActionError> {
+) -> std::result::Result<Option<CertSelectionRequest>, WsActionError> {
     if let Some(index) = cert_index {
         if index == 0 {
             return Err(WsActionError::Invalid(
@@ -597,22 +620,26 @@ fn parse_cert_selection(
         return Ok(None);
     }
 
-    Ok(Some(signer::CertSelectionRequest {
+    Ok(Some(CertSelectionRequest {
         thumbprint,
         index: cert_index,
     }))
 }
 
-fn classify_signer_error(err: anyhow::Error, has_explicit_cert_selection: bool) -> WsActionError {
-    let msg = format!("{err:#}");
-    if has_explicit_cert_selection
-        && (msg.contains("cert_thumbprint")
-            || msg.contains("cert_index")
-            || msg.contains("O certificado selecionado nao parece hardware token"))
-    {
-        return WsActionError::Invalid(msg);
+fn map_service_error(err: AppServiceError) -> WsActionError {
+    match err {
+        AppServiceError::Invalid(msg) => WsActionError::Invalid(msg),
+        AppServiceError::Signing(msg) => WsActionError::Signing(msg),
+        AppServiceError::BackendUnavailable(msg) => WsActionError::BackendUnavailable(msg),
     }
-    WsActionError::Signing(msg)
+}
+
+fn format_service_error(err: &AppServiceError) -> String {
+    match err {
+        AppServiceError::Invalid(msg)
+        | AppServiceError::Signing(msg)
+        | AppServiceError::BackendUnavailable(msg) => msg.clone(),
+    }
 }
 
 fn parse_request_message(message: Message) -> Result<ClientRequest> {
@@ -662,10 +689,10 @@ fn default_local_origins(host: &str, port: u16) -> Vec<String> {
     values
 }
 
-fn with_state(
-    state: Arc<SharedState>,
-) -> impl Filter<Extract = (Arc<SharedState>,), Error = Infallible> + Clone {
-    warp::any().map(move || state.clone())
+fn with_service(
+    service: Arc<AppService>,
+) -> impl Filter<Extract = (Arc<AppService>,), Error = Infallible> + Clone {
+    warp::any().map(move || service.clone())
 }
 
 fn with_expected_path(
@@ -744,7 +771,7 @@ struct SignPdfPayload {
     #[allow(dead_code)]
     filename: Option<String>,
     pdf_base64: String,
-    visible_signature: Option<signer::VisibleSignatureRequest>,
+    visible_signature: Option<VisibleSignatureRequest>,
     cert_thumbprint: Option<String>,
     cert_index: Option<usize>,
 }
@@ -760,7 +787,7 @@ struct SignPdfsPayload {
 struct SignPdfFileEntry {
     filename: Option<String>,
     pdf_base64: String,
-    visible_signature: Option<signer::VisibleSignatureRequest>,
+    visible_signature: Option<VisibleSignatureRequest>,
 }
 
 #[derive(Serialize)]
@@ -788,6 +815,7 @@ enum WsActionError {
     Busy,
     Invalid(String),
     Signing(String),
+    BackendUnavailable(String),
 }
 
 #[cfg(test)]
@@ -861,8 +889,8 @@ mod tests {
         .unwrap();
 
         let visible = payload.visible_signature.unwrap();
-        assert_eq!(visible.style, signer::VisibleSignatureStyle::Default);
-        assert_eq!(visible.timezone, signer::VisibleSignatureTimezone::Local);
+        assert_eq!(visible.style, contracts::VisibleSignatureStyle::Default);
+        assert_eq!(visible.timezone, contracts::VisibleSignatureTimezone::Local);
     }
 
     #[test]

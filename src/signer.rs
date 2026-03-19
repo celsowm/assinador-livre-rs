@@ -83,6 +83,8 @@ impl VisibleSignaturePlacement {
 pub struct VisibleSignatureRequest {
     pub placement: VisibleSignaturePlacement,
     #[serde(default)]
+    pub custom_rect: Option<[f32; 4]>,
+    #[serde(default)]
     pub style: VisibleSignatureStyle,
     #[serde(default)]
     pub timezone: VisibleSignatureTimezone,
@@ -107,6 +109,7 @@ pub enum VisibleSignatureTimezone {
 #[derive(Debug, Clone)]
 pub struct VisibleSignatureAppearance {
     pub placement: VisibleSignaturePlacement,
+    pub custom_rect: Option<[f32; 4]>,
     pub signer_name: String,
     pub style: VisibleSignatureStyle,
     pub timezone: VisibleSignatureTimezone,
@@ -148,6 +151,22 @@ pub fn sign_selected_files_with_selection(
     visible_signature: Option<VisibleSignatureRequest>,
 ) -> Result<SignReport> {
     let pdfs = select_pdfs();
+    sign_pdfs_with_selection(
+        pdfs,
+        cert_override,
+        verbose,
+        cert_selection,
+        visible_signature,
+    )
+}
+
+pub fn sign_pdfs_with_selection(
+    pdfs: Vec<PathBuf>,
+    cert_override: &CertOverride,
+    verbose: bool,
+    cert_selection: Option<CertSelectionRequest>,
+    visible_signature: Option<VisibleSignatureRequest>,
+) -> Result<SignReport> {
     if pdfs.is_empty() {
         return Ok(SignReport {
             signed: Vec::new(),
@@ -161,6 +180,7 @@ pub fn sign_selected_files_with_selection(
     let cert = &certs[cert_idx];
     let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
         placement: cfg.placement,
+        custom_rect: cfg.custom_rect,
         signer_name: cert.subject.clone(),
         style: cfg.style,
         timezone: cfg.timezone,
@@ -216,6 +236,7 @@ pub fn sign_single_pdf_bytes(
 
     let visible_signature = visible_signature.map(|cfg| VisibleSignatureAppearance {
         placement: cfg.placement,
+        custom_rect: cfg.custom_rect,
         signer_name: cert.subject.clone(),
         style: cfg.style,
         timezone: cfg.timezone,
@@ -275,6 +296,7 @@ pub fn sign_batch_pdf_bytes(
                 .as_ref()
                 .map(|cfg| VisibleSignatureAppearance {
                     placement: cfg.placement,
+                    custom_rect: cfg.custom_rect,
                     signer_name: cert.subject.clone(),
                     style: cfg.style,
                     timezone: cfg.timezone,
@@ -364,7 +386,7 @@ pub fn sign_pdf_bytes(
     });
 
     let widget_rect = visible_signature
-        .map(|cfg| compute_visible_signature_rect(first_page_media_box, cfg.placement))
+        .map(|cfg| resolve_visible_signature_rect(first_page_media_box, cfg))
         .unwrap_or([0.0, 0.0, 0.0, 0.0]);
 
     let mut annots = extract_page_annots(&doc, &first_page_dict);
@@ -710,6 +732,67 @@ fn compute_visible_signature_rect(
     };
 
     [x, y, x + width, y + height]
+}
+
+fn resolve_visible_signature_rect(
+    media_box: [f32; 4],
+    cfg: &VisibleSignatureAppearance,
+) -> [f32; 4] {
+    if let Some(custom) = cfg.custom_rect
+        && let Some(rect) = normalize_custom_rect(media_box, custom)
+    {
+        return rect;
+    }
+    compute_visible_signature_rect(media_box, cfg.placement)
+}
+
+fn normalize_custom_rect(media_box: [f32; 4], rect: [f32; 4]) -> Option<[f32; 4]> {
+    let llx = media_box[0];
+    let lly = media_box[1];
+    let urx = media_box[2];
+    let ury = media_box[3];
+    let page_w = (urx - llx).max(1.0);
+    let page_h = (ury - lly).max(1.0);
+
+    let all_ratio = rect
+        .iter()
+        .all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0 + f32::EPSILON);
+
+    let mut x0 = rect[0];
+    let mut y0 = rect[1];
+    let mut x1 = rect[2];
+    let mut y1 = rect[3];
+
+    if all_ratio {
+        x0 = llx + rect[0] * page_w;
+        y0 = lly + rect[1] * page_h;
+        x1 = llx + rect[2] * page_w;
+        y1 = lly + rect[3] * page_h;
+    }
+
+    let min_w = (page_w * 0.02).max(20.0).min(page_w);
+    let min_h = (page_h * 0.02).max(20.0).min(page_h);
+
+    x0 = x0.clamp(llx, urx);
+    x1 = x1.clamp(llx, urx);
+    y0 = y0.clamp(lly, ury);
+    y1 = y1.clamp(lly, ury);
+
+    let mut left = x0.min(x1);
+    let mut right = x0.max(x1);
+    let mut bottom = y0.min(y1);
+    let mut top = y0.max(y1);
+
+    if right - left < min_w {
+        right = (left + min_w).min(urx);
+        left = (right - min_w).max(llx);
+    }
+    if top - bottom < min_h {
+        top = (bottom + min_h).min(ury);
+        bottom = (top - min_h).max(lly);
+    }
+
+    Some([left, bottom, right, top])
 }
 
 fn build_visible_signature_appearance(
@@ -1668,7 +1751,7 @@ fn output_name(input: &Path) -> PathBuf {
     input.with_file_name(format!("{stem}_assinado.pdf"))
 }
 
-fn select_pdfs() -> Vec<PathBuf> {
+pub fn pick_pdfs() -> Vec<PathBuf> {
     let desktop = env::var("USERPROFILE")
         .map(|h| PathBuf::from(h).join("Desktop"))
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -1678,6 +1761,10 @@ fn select_pdfs() -> Vec<PathBuf> {
         .set_directory(&desktop)
         .pick_files()
         .unwrap_or_default()
+}
+
+fn select_pdfs() -> Vec<PathBuf> {
+    pick_pdfs()
 }
 
 fn next_free_obj_num(pdf: &[u8]) -> Result<u32> {
@@ -1778,6 +1865,7 @@ mod tests {
             [0.0, 0.0, 110.0, 180.0],
             &VisibleSignatureAppearance {
                 placement: VisibleSignaturePlacement::TopLeftVertical,
+                custom_rect: None,
                 signer_name: "Teste".to_string(),
                 style: VisibleSignatureStyle::Default,
                 timezone: VisibleSignatureTimezone::Local,
@@ -1797,6 +1885,7 @@ mod tests {
             [0.0, 0.0, 220.0, 72.0],
             &VisibleSignatureAppearance {
                 placement: VisibleSignaturePlacement::TopLeftHorizontal,
+                custom_rect: None,
                 signer_name: "Teste".to_string(),
                 style: VisibleSignatureStyle::Default,
                 timezone: VisibleSignatureTimezone::Local,

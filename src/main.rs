@@ -1,10 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod application;
 mod config;
+mod contracts;
 mod logger;
+mod runtime;
+#[cfg(windows)]
 mod signer;
-mod tray;
+mod signer_backend;
 mod ws;
 
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
