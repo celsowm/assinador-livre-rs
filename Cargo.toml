@@ -12,17 +12,22 @@ categories = ["cryptography"]
 
 [dependencies]
 anyhow = "1"
+auto-launch = "0.5"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"] }
 directories = "5"
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
 lopdf = "0.34"
+pdfium-render = { version = "0.8", default-features = false, features = ["image", "pdfium_latest"] }
 rfd = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 single-instance = "0.3"
+slint = "1.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tokio-tungstenite = "0.28"
+tray-icon = "0.21"
 uuid = { version = "1", features = ["v4"] }
 warp = "0.3"
 
@@ -34,13 +39,13 @@ windows = { version = "0.58", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
-windows-sys = { version = "0.48", features = ["Win32_UI_WindowsAndMessaging"] }
-
-[target.'cfg(target_os = "windows")'.dependencies]
-tray-item = "0.10"
+windows-sys = { version = "0.48", features = ["Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
+
+[build-dependencies]
+slint-build = "1.13"
 
 [package.metadata.wix]
 product-name = "Assinador Livre"

@@ -23,6 +23,7 @@ Aplicacao desktop em Rust para assinatura digital de PDF com certificado A3 via 
 
 - Windows
 - Rust toolchain (para desenvolvimento)
+- Git LFS (para clonar os binarios de `third_party/pdfium`)
 - Middleware/driver do token A3 instalado
 - Certificado com chave privada disponivel no repositorio `MY`
 
@@ -37,6 +38,10 @@ Se a pagina estiver vazia, ainda nao existe versao publicada para download.
 Arquivo esperado em cada release:
 
 - `assinador-livre-rs-<versao>-x64.msi`
+- `assinador-livre-rs-<versao>-x64.msix`
+- `assinador-livre-rs-<versao>-linux-x64.tar.gz`
+- `assinador-livre-rs-<versao>-linux-x64.AppImage`
+- `assinador-livre-rs-<versao>-macos-x64.tar.gz`
 
 Fluxo recomendado:
 
@@ -58,6 +63,21 @@ Binario esperado:
 ```text
 target\\release\\assinador-livre-rs.exe
 ```
+
+## Preview PDF (PDFium)
+
+O preview da primeira pagina no dialogo de assinatura usa biblioteca nativa PDFium.
+
+- Binarios versionados no repositorio: `third_party/pdfium/*`
+- Fallback automatico para biblioteca do sistema quando necessario.
+
+Override explicito em runtime:
+
+```powershell
+$env:ASSINADOR_PDFIUM_PATH = "C:\\caminho\\para\\pdfium.dll"
+```
+
+No Linux/macOS, a variavel deve apontar para `libpdfium.so` ou `libpdfium.dylib`.
 
 ## Build do instalador MSI (desenvolvimento)
 
@@ -113,6 +133,33 @@ Configure em `Settings -> Secrets and variables -> Actions -> Variables`:
 - `MSIX_PUBLISHER_DISPLAY_NAME` (deve bater com o display name do publisher no Partner Center, ex.: `celsowm`)
 
 Depois disso, todo `push` na `main` gera e anexa `assinador-livre-rs-<versao>-x64.msix` na release `v<versao>`.
+
+## Build Linux (tar.gz + AppImage)
+
+```bash
+cargo build --release --target x86_64-unknown-linux-gnu
+bash ./scripts/build-linux-packages.sh
+```
+
+Saidas esperadas:
+
+```text
+target/packages/linux/assinador-livre-rs-<versao>-linux-x64.tar.gz
+target/packages/linux/assinador-livre-rs-<versao>-linux-x64.AppImage
+```
+
+## Build macOS (app bundle em tar.gz)
+
+```bash
+cargo build --release --target x86_64-apple-darwin
+bash ./scripts/build-macos-package.sh
+```
+
+Saida esperada:
+
+```text
+target/packages/macos/assinador-livre-rs-<versao>-macos-x64.tar.gz
+```
 
 ## Modos de execucao (CLI)
 
@@ -432,6 +479,7 @@ O workflow `.github/workflows/release-msi.yml` cobre:
 - build do executavel;
 - assinatura de `assinador-livre-rs.exe` e `.msi` via Azure Key Vault;
 - publicacao de release no GitHub;
+- build e upload de artefatos Linux (`tar.gz` + `AppImage`) e macOS (`tar.gz`);
 - criacao/atualizacao de submissao da Microsoft Store (EXE/MSI);
 - envio para certificacao (quando `submit=true`).
 
@@ -459,6 +507,7 @@ Quando `WINDOWS_SIGN_PFX_*` estiver definido, o workflow usa PFX automaticamente
 - exige bump de `version` no `Cargo.toml`;
 - gera tag `v<versao>` quando ainda nao existe;
 - publica asset `assinador-livre-rs-<versao>-x64.msi`;
+- anexa `assinador-livre-rs-<versao>-x64.msix`, Linux (`tar.gz` + `AppImage`) e macOS (`tar.gz`) no mesmo release;
 - envia automaticamente para certificacao da Store.
 
 ### Modo manual (`workflow_dispatch`)

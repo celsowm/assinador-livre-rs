@@ -16,8 +16,8 @@ jobs:
             target: x86_64-pc-windows-msvc
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
 
     runs-on: ${{ matrix.os }}
 
@@ -29,6 +29,21 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Validate PDFium hashes (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify-pdfium-hashes.ps1
+
+      - name: Validate PDFium hashes (Unix)
+        if: runner.os != 'Windows'
+        run: bash ./scripts/verify-pdfium-hashes.sh
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
 
       - name: Cargo check
         run: cargo check --target ${{ matrix.target }}

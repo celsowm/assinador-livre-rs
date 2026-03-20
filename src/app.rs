@@ -1,12 +1,13 @@
 use crate::{
     application::{AppService, AppServiceError},
+    cert_dialog::{self, CertDialogInput},
     config::LoadedConfig,
     contracts::{TraySigningRequest, VisibleSignatureRequest},
     logger,
-    runtime::{
-        CertDialogInput, DesktopRuntime, TrayCommand, UiMessageLevel, create_default_runtime,
-    },
-    signer_backend, ws,
+    runtime::{DesktopRuntime, UiMessageLevel, create_default_runtime},
+    signer_backend,
+    tray::{self, TrayCommand},
+    ws,
 };
 use anyhow::{Context, Result};
 use std::{env, sync::Arc};
@@ -91,7 +92,7 @@ fn run_sign_now(
 fn run_tray_mode(service: Arc<AppService>, runtime: Arc<dyn DesktopRuntime>) -> Result<()> {
     let _instance = runtime.single_instance_guard()?;
 
-    if let Err(e) = runtime.set_startup(service.config.startup_with_os_login) {
+    if let Err(e) = crate::startup::set_startup(service.config.startup_with_os_login) {
         logger::warn(format!("Falha ao atualizar auto-start: {e:#}"));
     }
 
@@ -104,9 +105,7 @@ fn run_tray_mode(service: Arc<AppService>, runtime: Arc<dyn DesktopRuntime>) -> 
     ));
 
     let (command_tx, command_rx) = std::sync::mpsc::channel::<TrayCommand>();
-    let _tray = runtime
-        .create_tray(command_tx)
-        .context("Falha ao inicializar bandeja")?;
+    let _tray = tray::create_tray(command_tx).context("Falha ao inicializar bandeja")?;
 
     logger::info("App iniciado em modo bandeja");
 
@@ -199,7 +198,7 @@ fn handle_sign_from_tray(service: Arc<AppService>, runtime: Arc<dyn DesktopRunti
         .and_then(|idx| candidates.iter().position(|cert| cert.index == idx))
         .unwrap_or(0);
 
-    let choice = match runtime.choose_certificate_and_visible_signature(CertDialogInput {
+    let choice = match cert_dialog::choose_certificate_and_visible_signature(CertDialogInput {
         candidates,
         preselected_position,
         preview_pdf: pdfs.first().cloned(),

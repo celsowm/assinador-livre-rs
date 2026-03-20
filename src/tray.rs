@@ -1,18 +1,24 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use image::ImageReader;
 use std::{
-    ffi::OsStr,
-    os::windows::ffi::OsStrExt,
-    path::{Path, PathBuf},
-    sync::mpsc::Sender,
+    path::PathBuf,
+    sync::mpsc::{self, Sender},
+    thread,
 };
-use tray_item::{IconSource, TrayItem};
+#[cfg(not(windows))]
+use tray_icon::TrayIcon;
+use tray_icon::{
+    Icon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuItem},
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    HICON, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LR_LOADFROMFILE, LoadIconW, LoadImageW,
+    DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_QUIT,
 };
 
-use crate::logger;
-
-const ICON_FILE_NAME: &str = "icone-assinador-livre.ico";
+const ICON_FILE_NAME: &str = "icone-assinador-livre.png";
 
 #[derive(Debug, Clone, Copy)]
 pub enum TrayCommand {
@@ -22,87 +28,219 @@ pub enum TrayCommand {
 }
 
 pub struct TrayHandle {
-    _tray: TrayItem,
+    #[cfg(windows)]
+    thread_id: u32,
+    #[cfg(not(windows))]
+    _tray: Option<TrayIcon>,
+    #[cfg(not(windows))]
+    _menu: Option<Menu>,
+    #[cfg(not(windows))]
+    _sign_item: Option<MenuItem>,
+    #[cfg(not(windows))]
+    _playground_item: Option<MenuItem>,
+    #[cfg(not(windows))]
+    _exit_item: Option<MenuItem>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for TrayHandle {
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            let _ = PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0);
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub fn create_tray(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
-    let icon = resolve_icon_path()
-        .and_then(|path| {
-            let loaded = load_icon_from_file(&path);
-            if loaded.is_none() {
-                logger::warn(format!(
-                    "Nao foi possivel carregar icone customizado da bandeja em {}. Usando padrao do Windows.",
-                    path.display()
-                ));
-            }
-            loaded
-        })
-        .unwrap_or_else(|| unsafe { LoadIconW(0, IDI_APPLICATION) });
-
-    if icon == 0 {
-        bail!("Falha ao carregar icone padrao do Windows");
+    #[cfg(windows)]
+    {
+        return create_tray_windows(command_tx);
     }
 
-    let mut tray = TrayItem::new("Assinador Livre", IconSource::RawIcon(icon))
-        .context("Falha ao criar icone da bandeja")?;
+    #[cfg(not(windows))]
+    {
+        create_tray_polling(command_tx)
+    }
+}
 
-    let sign_tx = command_tx.clone();
-    tray.add_menu_item("Assinar documento", move || {
-        let _ = sign_tx.send(TrayCommand::SignDocument);
+#[cfg(windows)]
+fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
+
+    let worker = thread::Builder::new()
+        .name("tray-win32-loop".to_string())
+        .spawn(move || {
+            let run = || -> Result<()> {
+                let menu = Menu::new();
+                let sign_item = MenuItem::new("Assinar documento", true, None);
+                let playground_item = MenuItem::new("Abrir playground", true, None);
+                let exit_item = MenuItem::new("Sair", true, None);
+
+                menu.append(&sign_item)
+                    .context("Falha ao criar item de menu 'Assinar documento'")?;
+                menu.append(&playground_item)
+                    .context("Falha ao criar item de menu 'Abrir playground'")?;
+                menu.append(&exit_item)
+                    .context("Falha ao criar item de menu 'Sair'")?;
+
+                let icon = load_icon()?;
+                let _tray = TrayIconBuilder::new()
+                    .with_tooltip("Assinador Livre")
+                    .with_menu(Box::new(menu.clone()))
+                    .with_icon(icon)
+                    .build()
+                    .context("Falha ao inicializar bandeja")?;
+
+                let sign_id = sign_item.id().clone();
+                let playground_id = playground_item.id().clone();
+                let exit_id = exit_item.id().clone();
+                let thread_id = unsafe { GetCurrentThreadId() };
+                let handler_tx = command_tx.clone();
+
+                MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                    if event.id == sign_id {
+                        let _ = handler_tx.send(TrayCommand::SignDocument);
+                    } else if event.id == playground_id {
+                        let _ = handler_tx.send(TrayCommand::OpenPlayground);
+                    } else if event.id == exit_id {
+                        let _ = handler_tx.send(TrayCommand::Exit);
+                        unsafe {
+                            let _ = PostThreadMessageW(thread_id, WM_QUIT, 0, 0);
+                        }
+                    }
+                }));
+
+                let _ = ready_tx.send(Ok(thread_id));
+
+                let mut msg: MSG = unsafe { std::mem::zeroed() };
+                loop {
+                    let status = unsafe { GetMessageW(&mut msg, 0, 0, 0) };
+                    if status <= 0 {
+                        break;
+                    }
+                    unsafe {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+
+                MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+
+                // keep menu and items alive for the duration of the loop
+                let _ = (menu, sign_item, playground_item, exit_item);
+                Ok(())
+            };
+
+            if let Err(err) = run() {
+                let _ = ready_tx.send(Err(err));
+            }
+        })
+        .context("Falha ao iniciar thread da bandeja")?;
+
+    let thread_id = ready_rx
+        .recv()
+        .context("Falha ao iniciar bandeja (sem resposta da thread)")??;
+
+    Ok(TrayHandle {
+        thread_id,
+        worker: Some(worker),
     })
-    .context("Falha ao criar item de menu 'Assinar documento'")?;
+}
 
-    let playground_tx = command_tx.clone();
-    tray.add_menu_item("Abrir playground", move || {
-        let _ = playground_tx.send(TrayCommand::OpenPlayground);
+#[cfg(not(windows))]
+fn create_tray_polling(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
+    let menu = Menu::new();
+    let sign_item = MenuItem::new("Assinar documento", true, None);
+    let playground_item = MenuItem::new("Abrir playground", true, None);
+    let exit_item = MenuItem::new("Sair", true, None);
+
+    menu.append(&sign_item)
+        .context("Falha ao criar item de menu 'Assinar documento'")?;
+    menu.append(&playground_item)
+        .context("Falha ao criar item de menu 'Abrir playground'")?;
+    menu.append(&exit_item)
+        .context("Falha ao criar item de menu 'Sair'")?;
+
+    let icon = load_icon()?;
+    let tray = TrayIconBuilder::new()
+        .with_tooltip("Assinador Livre")
+        .with_menu(Box::new(menu.clone()))
+        .with_icon(icon)
+        .build()
+        .context("Falha ao inicializar bandeja")?;
+
+    let sign_id = sign_item.id().clone();
+    let playground_id = playground_item.id().clone();
+    let exit_id = exit_item.id().clone();
+    let worker_tx = command_tx.clone();
+
+    let worker = thread::Builder::new()
+        .name("tray-menu-events".to_string())
+        .spawn(move || {
+            while let Ok(event) = MenuEvent::receiver().recv() {
+                if event.id == sign_id {
+                    let _ = worker_tx.send(TrayCommand::SignDocument);
+                } else if event.id == playground_id {
+                    let _ = worker_tx.send(TrayCommand::OpenPlayground);
+                } else if event.id == exit_id {
+                    let _ = worker_tx.send(TrayCommand::Exit);
+                    break;
+                }
+            }
+        })
+        .context("Falha ao iniciar worker de eventos da bandeja")?;
+
+    Ok(TrayHandle {
+        _tray: Some(tray),
+        _menu: Some(menu),
+        _sign_item: Some(sign_item),
+        _playground_item: Some(playground_item),
+        _exit_item: Some(exit_item),
+        worker: Some(worker),
     })
-    .context("Falha ao criar item de menu 'Abrir playground'")?;
+}
 
-    tray.add_menu_item("Sair", move || {
-        let _ = command_tx.send(TrayCommand::Exit);
-    })
-    .context("Falha ao criar item de menu 'Sair'")?;
+fn load_icon() -> Result<Icon> {
+    let image = if let Some(path) = resolve_icon_path() {
+        ImageReader::open(&path)
+            .with_context(|| format!("Falha ao abrir icone da bandeja em {}", path.display()))?
+            .decode()
+            .with_context(|| {
+                format!(
+                    "Falha ao decodificar icone da bandeja em {}",
+                    path.display()
+                )
+            })?
+            .into_rgba8()
+    } else {
+        image::load_from_memory(include_bytes!("../assets/icone-assinador-livre.png"))
+            .context("Falha ao decodificar icone embutido da bandeja")?
+            .into_rgba8()
+    };
 
-    Ok(TrayHandle { _tray: tray })
+    let (width, height) = image.dimensions();
+    Icon::from_rgba(image.into_raw(), width, height)
+        .map_err(|err| anyhow::anyhow!("Falha ao criar icone da bandeja: {err:#}"))
 }
 
 fn resolve_icon_path() -> Option<PathBuf> {
     let exe_path = std::env::current_exe().ok()?;
     let exe_dir = exe_path.parent()?;
+
     let candidates = [
         exe_dir.join("assets").join(ICON_FILE_NAME),
         exe_dir
             .parent()
-            .map(|p| p.join("assets").join(ICON_FILE_NAME))?,
+            .map(|parent| parent.join("assets").join(ICON_FILE_NAME))?,
         exe_dir
             .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("assets").join(ICON_FILE_NAME))?,
+            .and_then(|parent| parent.parent())
+            .map(|parent| parent.join("assets").join(ICON_FILE_NAME))?,
     ];
 
     candidates.into_iter().find(|path| path.exists())
-}
-
-fn load_icon_from_file(path: &Path) -> Option<HICON> {
-    let wide_path: Vec<u16> = OsStr::new(path)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let icon = unsafe {
-        LoadImageW(
-            0,
-            wide_path.as_ptr(),
-            IMAGE_ICON,
-            0,
-            0,
-            LR_DEFAULTCOLOR | LR_LOADFROMFILE,
-        )
-    };
-
-    if icon == 0 {
-        return None;
-    }
-
-    Some(icon)
 }

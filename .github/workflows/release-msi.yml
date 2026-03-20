@@ -150,6 +150,11 @@ jobs:
           Write-Error "Nenhum modo de assinatura configurado. Configure PFX (WINDOWS_SIGN_PFX_*) ou Azure Key Vault (AZURE_*)."
           exit 1
 
+      - name: Validate PDFium hashes
+        if: steps.release_guard.outputs.should_release == 'true'
+        shell: pwsh
+        run: ./scripts/verify-pdfium-hashes.ps1
+
       - name: Validate signing secret presence (keyvault)
         if: steps.release_guard.outputs.should_release == 'true'
         shell: pwsh
@@ -343,6 +348,83 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: ${{ steps.artifact.outputs.asset_path }}
+
+  release-linux:
+    runs-on: ubuntu-latest
+    needs: release-msi
+    if: needs.release-msi.outputs.should_release == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Validate PDFium hashes
+        run: bash ./scripts/verify-pdfium-hashes.sh
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev
+
+      - name: Build Linux binary
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build Linux packages
+        run: bash ./scripts/build-linux-packages.sh "${{ needs.release-msi.outputs.version }}"
+
+      - name: Verify Linux package contents
+        run: |
+          tar -tzf "target/packages/linux/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-linux-x64.tar.gz" | grep -Eq '(^|\\./)lib/libpdfium.so$'
+          chmod +x "target/packages/linux/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-linux-x64.AppImage"
+          "target/packages/linux/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-linux-x64.AppImage" --appimage-extract >/dev/null
+          test -f squashfs-root/usr/lib/libpdfium.so
+          rm -rf squashfs-root
+
+      - name: Upload Linux artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-msi.outputs.tag }}
+          files: |
+            target/packages/linux/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-linux-x64.tar.gz
+            target/packages/linux/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-linux-x64.AppImage
+
+  release-macos:
+    runs-on: macos-13
+    needs: release-msi
+    if: needs.release-msi.outputs.should_release == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Validate PDFium hashes
+        run: bash ./scripts/verify-pdfium-hashes.sh
+
+      - name: Build macOS binary
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build macOS package
+        run: bash ./scripts/build-macos-package.sh "${{ needs.release-msi.outputs.version }}"
+
+      - name: Verify macOS package contents
+        run: |
+          tar -tzf "target/packages/macos/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-macos-x64.tar.gz" | grep -q 'Assinador Livre RS.app/Contents/Frameworks/libpdfium.dylib'
+
+      - name: Upload macOS artifact to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release-msi.outputs.tag }}
+          files: target/packages/macos/assinador-livre-rs-${{ needs.release-msi.outputs.version }}-macos-x64.tar.gz
 
   store-submission:
     runs-on: windows-latest

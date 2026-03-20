@@ -1,0 +1,23 @@
+{
+  "source": {
+    "repository": "https://github.com/bblanchon/pdfium-binaries",
+    "release_tag": "chromium/7734"
+  },
+  "artifacts": [
+    {
+      "platform": "windows-x64",
+      "file": "windows-x64/pdfium.dll",
+      "sha256": "139D3D3E3A4208389B8EE6390279ED118E28175BA888B27854FC0FF918DFE6E5"
+    },
+    {
+      "platform": "linux-x64",
+      "file": "linux-x64/libpdfium.so",
+      "sha256": "68060B06D26BE8D8AD635D8043B8B1D4E7DA8FDE0C7844DDF3F388E863A94D9A"
+    },
+    {
+      "platform": "macos-x64",
+      "file": "macos-x64/libpdfium.dylib",
+      "sha256": "6D8A8352E596BED77ACBAC79FBFAB75AB369539495B9208EB0C03EE3E8E612BE"
+    }
+  ]
+}

@@ -108,6 +108,10 @@ $exePath = Join-Path (Get-Location) ("target\\$TargetTriple\\release\\assinador-
 if (-not (Test-Path $exePath)) {
   throw "Executavel nao encontrado: $exePath"
 }
+$pdfiumPath = Join-Path (Get-Location) "third_party\\pdfium\\windows-x64\\pdfium.dll"
+if (-not (Test-Path $pdfiumPath)) {
+  throw "PDFium nao encontrado: $pdfiumPath"
+}
 
 $outRoot = Join-Path (Get-Location) $OutputDir
 $layout = Join-Path $outRoot "layout"
@@ -121,6 +125,7 @@ New-Item -ItemType Directory -Force -Path $assets | Out-Null
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 
 Copy-Item $exePath (Join-Path $appDir "assinador-livre-rs.exe") -Force
+Copy-Item $pdfiumPath (Join-Path $appDir "pdfium.dll") -Force
 Copy-Item $LogoPath (Join-Path $assets "StoreLogo.png") -Force
 
 $manifestPath = Join-Path $layout "AppxManifest.xml"

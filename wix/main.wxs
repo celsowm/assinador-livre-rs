@@ -39,6 +39,10 @@
                 Name="assinador-livre-rs.exe"
                 Source="$(var.CargoTargetBinDir)\assinador-livre-rs.exe"
                 KeyPath="yes" />
+              <File
+                Id="PdfiumDll"
+                Name="pdfium.dll"
+                Source="$(sys.SOURCEFILEDIR)..\third_party\pdfium\windows-x64\pdfium.dll" />
             </Component>
           </Directory>
         </Directory>

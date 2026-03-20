@@ -40,6 +40,10 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
+      - name: Validate PDFium hashes
+        shell: pwsh
+        run: ./scripts/verify-pdfium-hashes.ps1
+
       - name: Build and release MSIX
         shell: pwsh
         env:

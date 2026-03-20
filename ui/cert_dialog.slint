@@ -1,0 +1,160 @@
+import { Button, CheckBox, ComboBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export component CertDialog inherits Window {
+    in property <[string]> certificate_items;
+    in-out property <int> selected_certificate;
+    in-out property <bool> use_auto;
+    in-out property <bool> visible_signature;
+    in-out property <int> placement_index;
+    in-out property <bool> manual_mode;
+
+    in property <[string]> placement_items;
+
+    in property <image> preview_image;
+    in property <bool> preview_available;
+    in property <string> preview_status;
+
+    in-out property <float> rect_x_norm;
+    in-out property <float> rect_y_norm;
+    in-out property <float> rect_w_norm;
+    in-out property <float> rect_h_norm;
+
+    callback preview_pointer_down(x: float, y: float);
+    callback preview_pointer_move(x: float, y: float);
+    callback preview_pointer_up();
+    callback accept();
+    callback reject();
+
+    title: "Selecao de certificado";
+    min-width: 980px;
+    min-height: 640px;
+
+    HorizontalBox {
+        spacing: 14px;
+        padding: 14px;
+
+        VerticalBox {
+            spacing: 10px;
+            width: 360px;
+
+            Text {
+                text: "Escolha o certificado para assinatura:";
+                wrap: word-wrap;
+            }
+
+            ComboBox {
+                model: root.certificate_items;
+                current-index: root.selected_certificate;
+                enabled: !root.use_auto;
+            }
+
+            CheckBox {
+                text: "Usar selecao automatica";
+                checked: root.use_auto;
+                toggled => {
+                    root.use_auto = self.checked;
+                }
+            }
+
+            CheckBox {
+                text: "Assinatura visivel";
+                checked: root.visible_signature;
+                toggled => {
+                    root.visible_signature = self.checked;
+                }
+            }
+
+            Text {
+                text: "Posicao da assinatura visivel:";
+            }
+
+            ComboBox {
+                model: root.placement_items;
+                current-index: root.placement_index;
+                enabled: root.visible_signature;
+            }
+
+            CheckBox {
+                text: "Posicionar manualmente na primeira pagina";
+                checked: root.manual_mode;
+                enabled: root.visible_signature && root.preview_available;
+                toggled => {
+                    root.manual_mode = self.checked;
+                }
+            }
+
+            Text {
+                text: root.preview_status;
+                wrap: word-wrap;
+            }
+
+            Rectangle { height: 1px; }
+
+            HorizontalBox {
+                spacing: 8px;
+                Button {
+                    text: "Assinar";
+                    clicked => { root.accept(); }
+                }
+                Button {
+                    text: "Cancelar";
+                    clicked => { root.reject(); }
+                }
+            }
+        }
+
+        Rectangle {
+            border-width: 1px;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            clip: true;
+
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: root.preview_image;
+                image-fit: fill;
+            }
+
+            if (!root.preview_available) : Rectangle {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                height: 68px;
+                border-width: 1px;
+
+                Text {
+                    x: 10px;
+                    y: 10px;
+                    width: parent.width - 20px;
+                    text: "Preview indisponivel neste ambiente. A assinatura visivel continua disponivel por posicao predefinida.";
+                    wrap: word-wrap;
+                }
+            }
+
+            if (root.preview_available && root.manual_mode && root.visible_signature) : Rectangle {
+                x: root.rect_x_norm * parent.width;
+                y: root.rect_y_norm * parent.height;
+                width: root.rect_w_norm * parent.width;
+                height: root.rect_h_norm * parent.height;
+                border-color: #f97316;
+                border-width: 2px;
+                background: #44fb923c;
+            }
+
+            TouchArea {
+                enabled: root.preview_available && root.manual_mode && root.visible_signature;
+                pointer-event(event) => {
+                    if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
+                        root.preview_pointer_down(self.mouse-x / self.width, self.mouse-y / self.height);
+                    } else if (event.button == PointerEventButton.left && (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel)) {
+                        root.preview_pointer_up();
+                    }
+                }
+                moved => {
+                    root.preview_pointer_move(self.mouse-x / self.width, self.mouse-y / self.height);
+                }
+            }
+        }
+    }
+}

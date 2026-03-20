@@ -2,6 +2,7 @@
 
 mod app;
 mod application;
+mod cert_dialog;
 mod config;
 mod contracts;
 mod logger;
@@ -9,6 +10,8 @@ mod runtime;
 #[cfg(windows)]
 mod signer;
 mod signer_backend;
+mod startup;
+mod tray;
 mod ws;
 
 use rfd::{MessageButtons, MessageDialog, MessageLevel};
