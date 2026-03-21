@@ -2,7 +2,10 @@ use crate::{
     application::{AppService, AppServiceError},
     cert_dialog::{self, CertDialogInput},
     config::LoadedConfig,
-    contracts::{TraySigningRequest, VisibleSignatureRequest},
+    contracts::{
+        TraySigningRequest, VisibleSignaturePlacement, VisibleSignatureRequest,
+        VisibleSignatureStyle, VisibleSignatureTimezone,
+    },
     logger,
     runtime::{DesktopRuntime, UiMessageLevel, create_default_runtime},
     signer_backend,
@@ -111,6 +114,9 @@ fn run_tray_mode(service: Arc<AppService>, runtime: Arc<dyn DesktopRuntime>) -> 
 
     loop {
         match command_rx.recv() {
+            Ok(TrayCommand::SignDocumentQuick) => {
+                handle_quick_sign_from_tray(service.clone(), runtime.clone());
+            }
             Ok(TrayCommand::SignDocument) => {
                 handle_sign_from_tray(service.clone(), runtime.clone());
             }
@@ -232,6 +238,52 @@ fn handle_sign_from_tray(service: Arc<AppService>, runtime: Arc<dyn DesktopRunti
         visible_signature: choice.visible_signature,
     }) {
         logger::error(format!("Falha na assinatura via bandeja: {err:?}"));
+        runtime.show_message(
+            UiMessageLevel::Error,
+            "Erro na assinatura",
+            &format_service_error(&err),
+        );
+    }
+
+    drop(permit);
+}
+
+fn handle_quick_sign_from_tray(service: Arc<AppService>, runtime: Arc<dyn DesktopRuntime>) {
+    let permit = match service.signing_gate.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            logger::warn("Assinatura rapida ignorada: app ocupado");
+            runtime.show_message(
+                UiMessageLevel::Warning,
+                "Assinatura em andamento",
+                "Ja existe uma assinatura em andamento. Tente novamente em instantes.",
+            );
+            return;
+        }
+    };
+
+    let pdfs = runtime.pick_pdfs();
+    if pdfs.is_empty() {
+        logger::info("Assinatura rapida via bandeja cancelada: nenhum PDF selecionado");
+        drop(permit);
+        return;
+    }
+
+    logger::info("Assinatura rapida iniciada via bandeja");
+
+    let quick_visible_signature = Some(VisibleSignatureRequest {
+        placement: VisibleSignaturePlacement::BottomCenterHorizontal,
+        custom_rect: None,
+        style: VisibleSignatureStyle::Default,
+        timezone: VisibleSignatureTimezone::Local,
+    });
+
+    if let Err(err) = service.sign_tray_request(TraySigningRequest {
+        pdfs,
+        cert_selection: None,
+        visible_signature: quick_visible_signature,
+    }) {
+        logger::error(format!("Falha na assinatura rapida via bandeja: {err:?}"));
         runtime.show_message(
             UiMessageLevel::Error,
             "Erro na assinatura",

@@ -22,6 +22,7 @@ const ICON_FILE_NAME: &str = "icone-assinador-livre.png";
 
 #[derive(Debug, Clone, Copy)]
 pub enum TrayCommand {
+    SignDocumentQuick,
     SignDocument,
     OpenPlayground,
     Exit,
@@ -34,6 +35,8 @@ pub struct TrayHandle {
     _tray: Option<TrayIcon>,
     #[cfg(not(windows))]
     _menu: Option<Menu>,
+    #[cfg(not(windows))]
+    _quick_sign_item: Option<MenuItem>,
     #[cfg(not(windows))]
     _sign_item: Option<MenuItem>,
     #[cfg(not(windows))]
@@ -76,10 +79,13 @@ fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
         .spawn(move || {
             let run = || -> Result<()> {
                 let menu = Menu::new();
+                let quick_sign_item = MenuItem::new("Assinar rapidamente", true, None);
                 let sign_item = MenuItem::new("Assinar documento", true, None);
                 let playground_item = MenuItem::new("Abrir playground", true, None);
                 let exit_item = MenuItem::new("Sair", true, None);
 
+                menu.append(&quick_sign_item)
+                    .context("Falha ao criar item de menu 'Assinar rapidamente'")?;
                 menu.append(&sign_item)
                     .context("Falha ao criar item de menu 'Assinar documento'")?;
                 menu.append(&playground_item)
@@ -95,6 +101,7 @@ fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
                     .build()
                     .context("Falha ao inicializar bandeja")?;
 
+                let quick_sign_id = quick_sign_item.id().clone();
                 let sign_id = sign_item.id().clone();
                 let playground_id = playground_item.id().clone();
                 let exit_id = exit_item.id().clone();
@@ -102,7 +109,9 @@ fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
                 let handler_tx = command_tx.clone();
 
                 MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-                    if event.id == sign_id {
+                    if event.id == quick_sign_id {
+                        let _ = handler_tx.send(TrayCommand::SignDocumentQuick);
+                    } else if event.id == sign_id {
                         let _ = handler_tx.send(TrayCommand::SignDocument);
                     } else if event.id == playground_id {
                         let _ = handler_tx.send(TrayCommand::OpenPlayground);
@@ -131,7 +140,7 @@ fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
                 MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
 
                 // keep menu and items alive for the duration of the loop
-                let _ = (menu, sign_item, playground_item, exit_item);
+                let _ = (menu, quick_sign_item, sign_item, playground_item, exit_item);
                 Ok(())
             };
 
@@ -154,10 +163,13 @@ fn create_tray_windows(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
 #[cfg(not(windows))]
 fn create_tray_polling(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
     let menu = Menu::new();
+    let quick_sign_item = MenuItem::new("Assinar rapidamente", true, None);
     let sign_item = MenuItem::new("Assinar documento", true, None);
     let playground_item = MenuItem::new("Abrir playground", true, None);
     let exit_item = MenuItem::new("Sair", true, None);
 
+    menu.append(&quick_sign_item)
+        .context("Falha ao criar item de menu 'Assinar rapidamente'")?;
     menu.append(&sign_item)
         .context("Falha ao criar item de menu 'Assinar documento'")?;
     menu.append(&playground_item)
@@ -173,6 +185,7 @@ fn create_tray_polling(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
         .build()
         .context("Falha ao inicializar bandeja")?;
 
+    let quick_sign_id = quick_sign_item.id().clone();
     let sign_id = sign_item.id().clone();
     let playground_id = playground_item.id().clone();
     let exit_id = exit_item.id().clone();
@@ -182,7 +195,9 @@ fn create_tray_polling(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
         .name("tray-menu-events".to_string())
         .spawn(move || {
             while let Ok(event) = MenuEvent::receiver().recv() {
-                if event.id == sign_id {
+                if event.id == quick_sign_id {
+                    let _ = worker_tx.send(TrayCommand::SignDocumentQuick);
+                } else if event.id == sign_id {
                     let _ = worker_tx.send(TrayCommand::SignDocument);
                 } else if event.id == playground_id {
                     let _ = worker_tx.send(TrayCommand::OpenPlayground);
@@ -197,6 +212,7 @@ fn create_tray_polling(command_tx: Sender<TrayCommand>) -> Result<TrayHandle> {
     Ok(TrayHandle {
         _tray: Some(tray),
         _menu: Some(menu),
+        _quick_sign_item: Some(quick_sign_item),
         _sign_item: Some(sign_item),
         _playground_item: Some(playground_item),
         _exit_item: Some(exit_item),
