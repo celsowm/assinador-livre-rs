@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use image::{Rgba, RgbaImage};
 use pdfium_render::prelude::*;
-use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{Image, LogicalPosition, LogicalSize, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel, WindowPosition, WindowSize};
 use std::{cell::RefCell, env, path::Path, path::PathBuf, rc::Rc};
 
 slint::include_modules!();
@@ -33,6 +33,9 @@ struct PlacementOption {
 const PDFIUM_OVERRIDE_ENV: &str = "ASSINADOR_PDFIUM_PATH";
 const PREVIEW_FALLBACK_HINT: &str =
     "A assinatura visivel continua disponivel via posicao predefinida.";
+const MANUAL_PLACEMENT_LABEL: &str = "Manual (arrastar no preview)";
+const DEFAULT_VISIBLE_SIGNATURE_PLACEMENT: VisibleSignaturePlacement =
+    VisibleSignaturePlacement::BottomCenterHorizontal;
 
 const PLACEMENTS: &[PlacementOption] = &[
     PlacementOption {
@@ -122,6 +125,36 @@ pub fn choose_certificate_and_visible_signature(
     }
 
     let ui = CertDialog::new().context("Falha ao criar janela de selecao de certificado")?;
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SPI_GETWORKAREA, SystemParametersInfoW};
+        let mut work: RECT = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                &mut work as *mut RECT as *mut _,
+                0,
+            )
+        };
+        if ok != 0 {
+            let work_w = (work.right - work.left) as f32;
+            let work_h = (work.bottom - work.top) as f32;
+            if work_w > 0.0 && work_h > 0.0 {
+                let win_w = (work_w * 0.80).min(980.0);
+                let win_h = (work_h * 0.80).min(640.0);
+                ui.set_pref_width(win_w);
+                ui.set_pref_height(win_h);
+                let cx = work.left as f32 + (work_w - win_w) / 2.0;
+                let cy = work.top as f32 + (work_h - win_h) / 2.0;
+                ui.window().set_size(WindowSize::Logical(LogicalSize::new(win_w, win_h)));
+                ui.window().set_position(WindowPosition::Logical(LogicalPosition::new(cx, cy)));
+            }
+        }
+    }
+
     let cert_items = input
         .candidates
         .iter()
@@ -141,13 +174,24 @@ pub fn choose_certificate_and_visible_signature(
             } else {
                 cert.subject.as_str()
             };
-            format!("[{}] {} | {} | {}", cert.index, subject, token, provider)
+            let full = format!("[{}] {} | {} | {}", cert.index, subject, token, provider);
+            if full.chars().count() > 45 {
+                let truncated: String = full.chars().take(44).collect();
+                format!("{truncated}…")
+            } else {
+                full
+            }
         })
         .collect::<Vec<_>>();
-    let placement_items = PLACEMENTS
+    let preview = load_preview(input.preview_pdf.as_deref());
+
+    let mut placement_items = PLACEMENTS
         .iter()
         .map(|entry| entry.ui_label.to_string())
         .collect::<Vec<_>>();
+    if preview.available {
+        placement_items.push(MANUAL_PLACEMENT_LABEL.to_string());
+    }
 
     let cert_items = cert_items
         .into_iter()
@@ -167,19 +211,32 @@ pub fn choose_certificate_and_visible_signature(
     ui.set_selected_certificate(preselected);
     ui.set_use_auto(false);
     ui.set_visible_signature(false);
-    ui.set_manual_mode(false);
     ui.set_placement_index(default_placement_index() as i32);
+    apply_predefined_rect(&ui, default_placement_index());
 
-    let preview = load_preview(input.preview_pdf.as_deref());
     ui.set_preview_image(preview.image.clone());
     ui.set_preview_available(preview.available);
     ui.set_preview_status(preview.status.into());
+    ui.set_preview_aspect(preview.aspect);
 
-    let initial_rect = default_rect_for_placement(default_placement_index());
-    ui.set_rect_x_norm(initial_rect[0]);
-    ui.set_rect_y_norm(initial_rect[1]);
-    ui.set_rect_w_norm(initial_rect[2]);
-    ui.set_rect_h_norm(initial_rect[3]);
+    ui.set_placement_index(default_placement_index() as i32);
+    apply_predefined_rect(&ui, default_placement_index());
+
+    let placement_ui = ui.as_weak();
+    ui.on_placement_changed(move || {
+        let Some(dialog) = placement_ui.upgrade() else {
+            return;
+        };
+
+        let placement_idx = dialog.get_placement_index().max(0) as usize;
+        let manual_selected = is_manual_placement_index(placement_idx, dialog.get_preview_available());
+        dialog.set_manual_mode(manual_selected);
+        if manual_selected {
+            return;
+        }
+
+        apply_predefined_rect(&dialog, placement_idx);
+    });
 
     let rect_drag = Rc::new(RefCell::new(DragState::new()));
     let pointer_ui = ui.as_weak();
@@ -257,13 +314,19 @@ pub fn choose_certificate_and_visible_signature(
         };
 
         let placement_idx = dialog.get_placement_index().max(0) as usize;
-        let placement = PLACEMENTS
-            .get(placement_idx)
-            .map(|entry| entry.value)
-            .unwrap_or(VisibleSignaturePlacement::BottomCenterHorizontal);
+        let manual_selected =
+            is_manual_placement_index(placement_idx, dialog.get_preview_available());
+        let placement = if manual_selected {
+            manual_rect_orientation(dialog.get_rect_w_norm(), dialog.get_rect_h_norm())
+        } else {
+            PLACEMENTS
+                .get(placement_idx)
+                .map(|entry| entry.value)
+                .unwrap_or(DEFAULT_VISIBLE_SIGNATURE_PLACEMENT)
+        };
 
         let visible_signature = if dialog.get_visible_signature() {
-            let custom_rect = if dialog.get_manual_mode() && dialog.get_preview_available() {
+            let custom_rect = if manual_selected && dialog.get_preview_available() {
                 Some(normalized_rect_to_pdf_rect(
                     dialog.get_rect_x_norm(),
                     dialog.get_rect_y_norm(),
@@ -313,16 +376,21 @@ struct PreviewData {
     image: Image,
     available: bool,
     status: String,
+    aspect: f32,
 }
 
 fn load_preview(preview_pdf: Option<&Path>) -> PreviewData {
-    let default_image = placeholder_preview(900, 1200);
+    let placeholder_width = 900;
+    let placeholder_height = 1200;
+    let default_image = placeholder_preview(placeholder_width, placeholder_height);
+    let default_aspect = placeholder_width as f32 / placeholder_height as f32;
 
     let Some(path) = preview_pdf else {
         return PreviewData {
             image: default_image,
             available: false,
             status: preview_unavailable_status("nenhum PDF selecionado"),
+            aspect: default_aspect,
         };
     };
 
@@ -331,14 +399,16 @@ fn load_preview(preview_pdf: Option<&Path>) -> PreviewData {
             image: default_image,
             available: false,
             status: preview_unavailable_status("arquivo de PDF nao encontrado"),
+            aspect: default_aspect,
         };
     }
 
     match render_preview_with_pdfium(path) {
-        Ok(image) => PreviewData {
+        Ok((image, aspect)) => PreviewData {
             image,
             available: true,
             status: "Preview ativo. Arraste o retangulo para posicionar.".to_string(),
+            aspect,
         },
         Err(err) => {
             logger::warn(format!(
@@ -349,12 +419,13 @@ fn load_preview(preview_pdf: Option<&Path>) -> PreviewData {
                 image: default_image,
                 available: false,
                 status: preview_unavailable_status(&preview_error_summary(&err)),
+                aspect: default_aspect,
             }
         }
     }
 }
 
-fn render_preview_with_pdfium(path: &Path) -> Result<Image> {
+fn render_preview_with_pdfium(path: &Path) -> Result<(Image, f32)> {
     let pdfium = bind_pdfium_for_preview()?;
 
     let doc = pdfium
@@ -370,7 +441,9 @@ fn render_preview_with_pdfium(path: &Path) -> Result<Image> {
         .context("Falha ao renderizar primeira pagina para preview")?;
     let image = render.as_image();
     let rgba = image.to_rgba8();
-    Ok(rgba_to_slint_image(&rgba))
+    let width = rgba.width().max(1) as f32;
+    let height = rgba.height().max(1) as f32;
+    Ok((rgba_to_slint_image(&rgba), width / height))
 }
 
 fn bind_pdfium_for_preview() -> Result<Pdfium> {
@@ -592,18 +665,75 @@ fn placeholder_preview(width: u32, height: u32) -> Image {
 fn default_placement_index() -> usize {
     PLACEMENTS
         .iter()
-        .position(|entry| entry.value == VisibleSignaturePlacement::BottomCenterHorizontal)
+        .position(|entry| entry.value == DEFAULT_VISIBLE_SIGNATURE_PLACEMENT)
         .unwrap_or(0)
 }
 
-fn default_rect_for_placement(index: usize) -> [f32; 4] {
+fn apply_predefined_rect(dialog: &CertDialog, index: usize) {
+    let safe_index = index.min(PLACEMENTS.len().saturating_sub(1));
+    dialog.set_manual_mode(false);
+    let [x, y, w, h] = rect_for_placement(safe_index);
+    dialog.set_rect_x_norm(x);
+    dialog.set_rect_y_norm(y);
+    dialog.set_rect_w_norm(w);
+    dialog.set_rect_h_norm(h);
+}
+
+fn is_manual_placement_index(index: usize, preview_available: bool) -> bool {
+    preview_available && index == PLACEMENTS.len()
+}
+
+fn manual_rect_orientation(rect_w: f32, rect_h: f32) -> VisibleSignaturePlacement {
+    if rect_h > rect_w {
+        VisibleSignaturePlacement::BottomCenterVertical
+    } else {
+        VisibleSignaturePlacement::BottomCenterHorizontal
+    }
+}
+
+fn rect_for_placement(index: usize) -> [f32; 4] {
+    let placement = PLACEMENTS
+        .get(index)
+        .map(|entry| entry.value)
+        .unwrap_or(DEFAULT_VISIBLE_SIGNATURE_PLACEMENT);
     let vertical = PLACEMENTS
         .get(index)
         .map(|entry| entry.vertical)
         .unwrap_or(false);
     let (w, h) = if vertical { (0.12, 0.24) } else { (0.24, 0.10) };
-    let x = (1.0 - w) / 2.0;
-    let y = (1.0 - h) / 2.0;
+    let margin = 0.04;
+
+    let x = match placement {
+        VisibleSignaturePlacement::TopLeftHorizontal
+        | VisibleSignaturePlacement::TopLeftVertical
+        | VisibleSignaturePlacement::BottomLeftHorizontal
+        | VisibleSignaturePlacement::BottomLeftVertical => margin,
+        VisibleSignaturePlacement::TopRightHorizontal
+        | VisibleSignaturePlacement::TopRightVertical
+        | VisibleSignaturePlacement::BottomRightHorizontal
+        | VisibleSignaturePlacement::BottomRightVertical => 1.0 - w - margin,
+        VisibleSignaturePlacement::BottomCenterHorizontal
+        | VisibleSignaturePlacement::BottomCenterVertical
+        | VisibleSignaturePlacement::CenterHorizontal
+        | VisibleSignaturePlacement::CenterVertical => (1.0 - w) / 2.0,
+    };
+
+    let y = match placement {
+        VisibleSignaturePlacement::TopLeftHorizontal
+        | VisibleSignaturePlacement::TopLeftVertical
+        | VisibleSignaturePlacement::TopRightHorizontal
+        | VisibleSignaturePlacement::TopRightVertical => margin,
+        VisibleSignaturePlacement::BottomLeftHorizontal
+        | VisibleSignaturePlacement::BottomLeftVertical
+        | VisibleSignaturePlacement::BottomRightHorizontal
+        | VisibleSignaturePlacement::BottomRightVertical
+        | VisibleSignaturePlacement::BottomCenterHorizontal
+        | VisibleSignaturePlacement::BottomCenterVertical => 1.0 - h - margin,
+        VisibleSignaturePlacement::CenterHorizontal | VisibleSignaturePlacement::CenterVertical => {
+            (1.0 - h) / 2.0
+        }
+    };
+
     [x, y, w, h]
 }
 
@@ -644,7 +774,7 @@ mod tests {
 
     #[test]
     fn placement_default_has_positive_size() {
-        let [_, _, w, h] = default_rect_for_placement(default_placement_index());
+        let [_, _, w, h] = rect_for_placement(default_placement_index());
         assert!(w > 0.0);
         assert!(h > 0.0);
     }

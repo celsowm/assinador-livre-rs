@@ -13,6 +13,7 @@ export component CertDialog inherits Window {
     in property <image> preview_image;
     in property <bool> preview_available;
     in property <string> preview_status;
+    in property <float> preview_aspect;
 
     in-out property <float> rect_x_norm;
     in-out property <float> rect_y_norm;
@@ -22,20 +23,30 @@ export component CertDialog inherits Window {
     callback preview_pointer_down(x: float, y: float);
     callback preview_pointer_move(x: float, y: float);
     callback preview_pointer_up();
+    callback placement_changed();
     callback accept();
     callback reject();
 
-    title: "Selecao de certificado";
-    min-width: 980px;
-    min-height: 640px;
+    in property <length> pref_width: 980px;
+    in property <length> pref_height: 640px;
+
+    title: "Assinador Livre em RUST";
+    min-width: root.pref_width;
+    max-width: root.pref_width;
+    min-height: root.pref_height;
+    max-height: root.pref_height;
+    preferred-width: root.pref_width;
+    preferred-height: root.pref_height;
 
     HorizontalBox {
         spacing: 14px;
         padding: 14px;
 
         VerticalBox {
-            spacing: 10px;
-            width: 360px;
+            spacing: 6px;
+            padding: 0px;
+            width: 340px;
+            vertical-stretch: 0;
 
             Text {
                 text: "Escolha o certificado para assinatura:";
@@ -46,10 +57,14 @@ export component CertDialog inherits Window {
                 model: root.certificate_items;
                 current-index: root.selected_certificate;
                 enabled: !root.use_auto;
+                height: 32px;
+                max-width: 320px;
             }
 
+            Rectangle { height: 14px; }
+
             CheckBox {
-                text: "Usar selecao automatica";
+                text: "Usar seleção automática";
                 checked: root.use_auto;
                 toggled => {
                     root.use_auto = self.checked;
@@ -57,63 +72,76 @@ export component CertDialog inherits Window {
             }
 
             CheckBox {
-                text: "Assinatura visivel";
+                text: "Assinatura visível";
                 checked: root.visible_signature;
                 toggled => {
                     root.visible_signature = self.checked;
                 }
             }
 
+            Rectangle { height: 8px; }
+
             Text {
-                text: "Posicao da assinatura visivel:";
+                text: "Posição da assinatura visível:";
             }
 
             ComboBox {
                 model: root.placement_items;
-                current-index: root.placement_index;
+                current-index <=> root.placement_index;
                 enabled: root.visible_signature;
-            }
-
-            CheckBox {
-                text: "Posicionar manualmente na primeira pagina";
-                checked: root.manual_mode;
-                enabled: root.visible_signature && root.preview_available;
-                toggled => {
-                    root.manual_mode = self.checked;
+                height: 32px;
+                max-width: 320px;
+                selected(_) => {
+                    root.placement_changed();
                 }
             }
+
+            Rectangle { height: 6px; }
 
             Text {
                 text: root.preview_status;
                 wrap: word-wrap;
             }
 
-            Rectangle { height: 1px; }
+            Rectangle {
+                vertical-stretch: 1;
+            }
 
             HorizontalBox {
                 spacing: 8px;
+                alignment: end;
                 Button {
                     text: "Assinar";
+                    height: 34px;
                     clicked => { root.accept(); }
                 }
                 Button {
                     text: "Cancelar";
+                    height: 34px;
                     clicked => { root.reject(); }
                 }
             }
         }
 
-        Rectangle {
+        preview-frame := Rectangle {
             border-width: 1px;
             horizontal-stretch: 1;
             vertical-stretch: 1;
             clip: true;
+            property <bool> dragging: false;
+
+            property <float> image_aspect: root.preview_aspect > 0.01 ? root.preview_aspect : 0.75;
+            property <float> container_aspect: self.height > 0px ? self.width / self.height : 1.0;
+            property <length> content_width: self.container_aspect > self.image_aspect ? self.height * self.image_aspect : self.width;
+            property <length> content_height: self.container_aspect > self.image_aspect ? self.height : self.width / self.image_aspect;
+            property <length> content_x: (self.width - self.content_width) / 2;
+            property <length> content_y: (self.height - self.content_height) / 2;
 
             Image {
                 width: parent.width;
                 height: parent.height;
                 source: root.preview_image;
-                image-fit: fill;
+                image-fit: contain;
             }
 
             if (!root.preview_available) : Rectangle {
@@ -127,32 +155,41 @@ export component CertDialog inherits Window {
                     x: 10px;
                     y: 10px;
                     width: parent.width - 20px;
-                    text: "Preview indisponivel neste ambiente. A assinatura visivel continua disponivel por posicao predefinida.";
+                    text: "Preview indisponível neste ambiente. A assinatura visível continua disponível por posição predefinida.";
                     wrap: word-wrap;
                 }
             }
 
-            if (root.preview_available && root.manual_mode && root.visible_signature) : Rectangle {
-                x: root.rect_x_norm * parent.width;
-                y: root.rect_y_norm * parent.height;
-                width: root.rect_w_norm * parent.width;
-                height: root.rect_h_norm * parent.height;
-                border-color: #f97316;
+            if (root.preview_available && root.visible_signature) : Rectangle {
+                x: preview-frame.content_x + root.rect_x_norm * preview-frame.content_width;
+                y: preview-frame.content_y + root.rect_y_norm * preview-frame.content_height;
+                width: root.rect_w_norm * preview-frame.content_width;
+                height: root.rect_h_norm * preview-frame.content_height;
+                border-color: root.manual_mode ? #f97316 : #22c55e;
                 border-width: 2px;
-                background: #44fb923c;
+                background: root.manual_mode ? #44fb923c : #4434d399;
             }
 
             TouchArea {
                 enabled: root.preview_available && root.manual_mode && root.visible_signature;
+                mouse-cursor: root.preview_available && root.manual_mode && root.visible_signature
+                    ? (preview-frame.dragging ? MouseCursor.grabbing : MouseCursor.grab)
+                    : MouseCursor.default;
                 pointer-event(event) => {
+                    let nx = (self.mouse-x - preview-frame.content_x) / preview-frame.content_width;
+                    let ny = (self.mouse-y - preview-frame.content_y) / preview-frame.content_height;
                     if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
-                        root.preview_pointer_down(self.mouse-x / self.width, self.mouse-y / self.height);
+                        preview-frame.dragging = true;
+                        root.preview_pointer_down(nx, ny);
                     } else if (event.button == PointerEventButton.left && (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel)) {
+                        preview-frame.dragging = false;
                         root.preview_pointer_up();
                     }
                 }
                 moved => {
-                    root.preview_pointer_move(self.mouse-x / self.width, self.mouse-y / self.height);
+                    let nx = (self.mouse-x - preview-frame.content_x) / preview-frame.content_width;
+                    let ny = (self.mouse-y - preview-frame.content_y) / preview-frame.content_height;
+                    root.preview_pointer_move(nx, ny);
                 }
             }
         }
