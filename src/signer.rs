@@ -2,7 +2,7 @@ use crate::{config::CertOverride, logger};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local, Utc};
 use lopdf::{Document, Object, ObjectId};
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
+use rfd::{MessageButtons, MessageDialog, MessageLevel};
 use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
@@ -138,26 +138,6 @@ impl Drop for OwnedCert {
             let _ = CertFreeCertificateContext(Some(self.context));
         }
     }
-}
-
-pub fn sign_selected_files(cert_override: &CertOverride, verbose: bool) -> Result<SignReport> {
-    sign_selected_files_with_selection(cert_override, verbose, None, None)
-}
-
-pub fn sign_selected_files_with_selection(
-    cert_override: &CertOverride,
-    verbose: bool,
-    cert_selection: Option<CertSelectionRequest>,
-    visible_signature: Option<VisibleSignatureRequest>,
-) -> Result<SignReport> {
-    let pdfs = select_pdfs();
-    sign_pdfs_with_selection(
-        pdfs,
-        cert_override,
-        verbose,
-        cert_selection,
-        visible_signature,
-    )
 }
 
 pub fn sign_pdfs_with_selection(
@@ -1749,22 +1729,6 @@ fn file_name(p: &Path) -> String {
 fn output_name(input: &Path) -> PathBuf {
     let stem = input.file_stem().unwrap_or_default().to_string_lossy();
     input.with_file_name(format!("{stem}_assinado.pdf"))
-}
-
-pub fn pick_pdfs() -> Vec<PathBuf> {
-    let desktop = env::var("USERPROFILE")
-        .map(|h| PathBuf::from(h).join("Desktop"))
-        .unwrap_or_else(|_| PathBuf::from("."));
-    FileDialog::new()
-        .set_title("Selecione os PDFs para assinar")
-        .add_filter("Arquivos PDF", &["pdf"])
-        .set_directory(&desktop)
-        .pick_files()
-        .unwrap_or_default()
-}
-
-fn select_pdfs() -> Vec<PathBuf> {
-    pick_pdfs()
 }
 
 fn next_free_obj_num(pdf: &[u8]) -> Result<u32> {
