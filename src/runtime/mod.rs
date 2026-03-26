@@ -52,16 +52,18 @@ impl DesktopRuntime for DefaultRuntime {
     }
 
     fn pick_pdfs(&self) -> Vec<PathBuf> {
-        let mut dialog = FileDialog::new()
+        let dialog = FileDialog::new()
             .set_title("Selecione os PDFs para assinar")
             .add_filter("Arquivos PDF", &["pdf"]);
 
         #[cfg(windows)]
-        {
+        let dialog = {
             if let Ok(profile) = std::env::var("USERPROFILE") {
-                dialog = dialog.set_directory(PathBuf::from(profile).join("Desktop"));
+                dialog.set_directory(PathBuf::from(profile).join("Desktop"))
+            } else {
+                dialog
             }
-        }
+        };
 
         dialog.pick_files().unwrap_or_default()
     }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use image::ImageReader;
 use std::{
     path::PathBuf,
-    sync::mpsc::{self, Sender},
+    sync::mpsc::Sender,
     thread,
 };
 #[cfg(not(windows))]

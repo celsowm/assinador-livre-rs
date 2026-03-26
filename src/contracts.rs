@@ -105,4 +105,5 @@ pub struct TraySigningRequest {
     pub pdfs: Vec<PathBuf>,
     pub cert_selection: Option<CertSelectionRequest>,
     pub visible_signature: Option<VisibleSignatureRequest>,
+    pub pin: Option<String>,
 }

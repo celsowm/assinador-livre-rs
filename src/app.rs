@@ -65,6 +65,7 @@ fn run_sign_now(
         pdfs,
         cert_selection: None,
         visible_signature: None,
+        pin: None,
     }) {
         Ok(report) => {
             logger::info(format!(
@@ -236,6 +237,7 @@ fn handle_sign_from_tray(service: Arc<AppService>, runtime: Arc<dyn DesktopRunti
         pdfs,
         cert_selection: choice.cert_selection,
         visible_signature: choice.visible_signature,
+        pin: choice.pin,
     }) {
         logger::error(format!("Falha na assinatura via bandeja: {err:?}"));
         runtime.show_message(
@@ -282,6 +284,7 @@ fn handle_quick_sign_from_tray(service: Arc<AppService>, runtime: Arc<dyn Deskto
         pdfs,
         cert_selection: None,
         visible_signature: quick_visible_signature,
+        pin: None,
     }) {
         logger::error(format!("Falha na assinatura rapida via bandeja: {err:?}"));
         runtime.show_message(
