@@ -41,6 +41,16 @@ windows = { version = "0.58", features = [
 ] }
 windows-sys = { version = "0.48", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
+[target.'cfg(not(windows))'.dependencies]
+openssl = { version = "0.10", features = ["v110"] }
+cryptoki = "0.6"
+hex = "0.4"
+secrecy = "0.8"
+cms = "0.2"
+der = { version = "0.7", features = ["derive"] }
+x509-cert = "0.2"
+const-oid = "0.9"
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 

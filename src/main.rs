@@ -7,7 +7,6 @@ mod config;
 mod contracts;
 mod logger;
 mod runtime;
-#[cfg(windows)]
 mod signer;
 mod signer_backend;
 mod startup;

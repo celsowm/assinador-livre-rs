@@ -3,19 +3,11 @@ use crate::{
     contracts::{
         BatchFileInput, BatchSignResult, CertSelectionRequest, CertificateSummary, SignReport,
         TraySigningRequest, VisibleSignatureRequest, WsSignResult,
+        VisibleSignaturePlacement, VisibleSignatureStyle, VisibleSignatureTimezone,
     },
 };
 use anyhow::Result;
 use std::sync::Arc;
-
-#[cfg(not(windows))]
-use crate::contracts::SIGNING_BACKEND_UNAVAILABLE;
-#[cfg(windows)]
-use crate::contracts::{
-    VisibleSignaturePlacement, VisibleSignatureStyle, VisibleSignatureTimezone,
-};
-#[cfg(not(windows))]
-use anyhow::bail;
 
 pub trait SignerBackend: Send + Sync {
     fn list_certificates(&self) -> Result<Vec<CertificateSummary>>;
@@ -48,22 +40,12 @@ pub trait SignerBackend: Send + Sync {
 }
 
 pub fn default_backend() -> Arc<dyn SignerBackend> {
-    #[cfg(windows)]
-    {
-        Arc::new(WindowsSignerBackend)
-    }
-
-    #[cfg(not(windows))]
-    {
-        Arc::new(StubSignerBackend)
-    }
+    Arc::new(GenericSignerBackend)
 }
 
-#[cfg(windows)]
-struct WindowsSignerBackend;
+struct GenericSignerBackend;
 
-#[cfg(windows)]
-impl SignerBackend for WindowsSignerBackend {
+impl SignerBackend for GenericSignerBackend {
     fn list_certificates(&self) -> Result<Vec<CertificateSummary>> {
         let certs = crate::signer::list_available_certificates()?;
         Ok(certs
@@ -103,6 +85,7 @@ impl SignerBackend for WindowsSignerBackend {
             verbose,
             visible_signature.map(to_signer_visible_signature),
             cert_selection.map(to_signer_cert_selection),
+            None, // WS currently doesn't support PIN
         )?;
 
         Ok(WsSignResult {
@@ -136,6 +119,7 @@ impl SignerBackend for WindowsSignerBackend {
             cert_override,
             verbose,
             cert_selection.map(to_signer_cert_selection),
+            None, // WS currently doesn't support PIN
         )?;
 
         Ok(BatchSignResult {
@@ -169,6 +153,7 @@ impl SignerBackend for WindowsSignerBackend {
             verbose,
             request.cert_selection.map(to_signer_cert_selection),
             request.visible_signature.map(to_signer_visible_signature),
+            request.pin,
         )?;
 
         Ok(SignReport {
@@ -178,7 +163,6 @@ impl SignerBackend for WindowsSignerBackend {
     }
 }
 
-#[cfg(windows)]
 fn to_signer_cert_selection(req: CertSelectionRequest) -> crate::signer::CertSelectionRequest {
     crate::signer::CertSelectionRequest {
         thumbprint: req.thumbprint,
@@ -186,7 +170,6 @@ fn to_signer_cert_selection(req: CertSelectionRequest) -> crate::signer::CertSel
     }
 }
 
-#[cfg(windows)]
 fn to_signer_visible_signature(
     req: VisibleSignatureRequest,
 ) -> crate::signer::VisibleSignatureRequest {
@@ -198,7 +181,6 @@ fn to_signer_visible_signature(
     }
 }
 
-#[cfg(windows)]
 fn to_signer_placement(
     placement: VisibleSignaturePlacement,
 ) -> crate::signer::VisibleSignaturePlacement {
@@ -242,7 +224,6 @@ fn to_signer_placement(
     }
 }
 
-#[cfg(windows)]
 fn to_signer_style(style: VisibleSignatureStyle) -> crate::signer::VisibleSignatureStyle {
     match style {
         VisibleSignatureStyle::Default => crate::signer::VisibleSignatureStyle::Default,
@@ -250,58 +231,9 @@ fn to_signer_style(style: VisibleSignatureStyle) -> crate::signer::VisibleSignat
     }
 }
 
-#[cfg(windows)]
 fn to_signer_timezone(tz: VisibleSignatureTimezone) -> crate::signer::VisibleSignatureTimezone {
     match tz {
         VisibleSignatureTimezone::Utc => crate::signer::VisibleSignatureTimezone::Utc,
         VisibleSignatureTimezone::Local => crate::signer::VisibleSignatureTimezone::Local,
-    }
-}
-
-#[cfg(not(windows))]
-struct StubSignerBackend;
-
-#[cfg(not(windows))]
-impl SignerBackend for StubSignerBackend {
-    fn list_certificates(&self) -> Result<Vec<CertificateSummary>> {
-        bail!("{SIGNING_BACKEND_UNAVAILABLE}: backend de assinatura disponivel apenas no Windows")
-    }
-
-    fn recommended_certificate_index(
-        &self,
-        _cert_override: &CertOverride,
-        _verbose: bool,
-    ) -> Result<usize> {
-        bail!("{SIGNING_BACKEND_UNAVAILABLE}: backend de assinatura disponivel apenas no Windows")
-    }
-
-    fn sign_single_pdf(
-        &self,
-        _input: &[u8],
-        _cert_override: &CertOverride,
-        _verbose: bool,
-        _visible_signature: Option<VisibleSignatureRequest>,
-        _cert_selection: Option<CertSelectionRequest>,
-    ) -> Result<WsSignResult> {
-        bail!("{SIGNING_BACKEND_UNAVAILABLE}: backend de assinatura disponivel apenas no Windows")
-    }
-
-    fn sign_batch_pdfs(
-        &self,
-        _inputs: Vec<BatchFileInput>,
-        _cert_override: &CertOverride,
-        _verbose: bool,
-        _cert_selection: Option<CertSelectionRequest>,
-    ) -> Result<BatchSignResult> {
-        bail!("{SIGNING_BACKEND_UNAVAILABLE}: backend de assinatura disponivel apenas no Windows")
-    }
-
-    fn sign_tray_request(
-        &self,
-        _request: TraySigningRequest,
-        _cert_override: &CertOverride,
-        _verbose: bool,
-    ) -> Result<SignReport> {
-        bail!("{SIGNING_BACKEND_UNAVAILABLE}: backend de assinatura disponivel apenas no Windows")
     }
 }

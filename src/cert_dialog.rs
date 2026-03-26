@@ -8,7 +8,9 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use image::{Rgba, RgbaImage};
 use pdfium_render::prelude::*;
-use slint::{Image, LogicalPosition, LogicalSize, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel, WindowPosition, WindowSize};
+use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+#[cfg(windows)]
+use slint::{LogicalPosition, LogicalSize, WindowPosition, WindowSize};
 use std::{cell::RefCell, env, path::Path, path::PathBuf, rc::Rc};
 
 slint::include_modules!();
@@ -22,6 +24,7 @@ pub struct CertDialogInput {
 pub struct CertDialogOutput {
     pub cert_selection: Option<CertSelectionRequest>,
     pub visible_signature: Option<VisibleSignatureRequest>,
+    pub pin: Option<String>,
 }
 
 struct PlacementOption {
@@ -299,6 +302,7 @@ pub fn choose_certificate_and_visible_signature(
             *accept_slot.borrow_mut() = Some(Some(CertDialogOutput {
                 cert_selection: None,
                 visible_signature: None,
+                pin: None,
             }));
             return;
         }
@@ -347,9 +351,12 @@ pub fn choose_certificate_and_visible_signature(
             None
         };
 
+        let pin = Some(dialog.get_pin_value().to_string()).filter(|s| !s.is_empty());
+
         *accept_slot.borrow_mut() = Some(Some(CertDialogOutput {
             cert_selection,
             visible_signature,
+            pin,
         }));
         dialog.hide().ok();
     });

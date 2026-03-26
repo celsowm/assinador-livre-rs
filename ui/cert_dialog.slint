@@ -24,6 +24,9 @@ export component CertDialog inherits Window {
     callback preview_pointer_move(x: float, y: float);
     callback preview_pointer_up();
     callback placement_changed();
+
+    in-out property <string> pin_value;
+
     callback accept();
     callback reject();
 
@@ -55,7 +58,7 @@ export component CertDialog inherits Window {
 
             ComboBox {
                 model: root.certificate_items;
-                current-index: root.selected_certificate;
+                current-index <=> root.selected_certificate;
                 enabled: !root.use_auto;
                 height: 32px;
                 max-width: 320px;
@@ -101,6 +104,19 @@ export component CertDialog inherits Window {
             Text {
                 text: root.preview_status;
                 wrap: word-wrap;
+            }
+
+            VerticalBox {
+                padding: 0px;
+                spacing: 4px;
+                Text { text: "PIN do Token (se necessário):"; }
+                input_pin := TextInput {
+                    text <=> root.pin_value;
+                    font-size: 14px;
+                    height: 28px;
+                    single-line: true;
+                    input-type: password;
+                }
             }
 
             Rectangle {

@@ -7,14 +7,18 @@ use serde::{Deserialize, Serialize};
 use std::{
     env, fs,
     io::{self, Write as _},
-    mem,
     path::{Path, PathBuf},
-    slice,
 };
-use windows::{
-    Win32::{Foundation::BOOL, Security::Cryptography::*},
-    core::{PSTR, w},
-};
+
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub use windows::OwnedCert;
+
+#[cfg(not(windows))]
+mod linux;
+#[cfg(not(windows))]
+pub use linux::OwnedCert;
 
 pub struct SignReport {
     pub signed: Vec<String>,
@@ -115,37 +119,13 @@ pub struct VisibleSignatureAppearance {
     pub timezone: VisibleSignatureTimezone,
 }
 
-pub struct OwnedCert {
-    pub subject: String,
-    pub issuer: String,
-    pub thumbprint: String,
-    pub context: *const CERT_CONTEXT,
-    pub valid_now: bool,
-    pub supports_digital_signature: bool,
-    pub key_provider_name: String,
-    pub key_container_name: String,
-    pub key_provider_type: u32,
-    pub key_spec: u32,
-    pub is_hardware_token: bool,
-}
-
-unsafe impl Send for OwnedCert {}
-unsafe impl Sync for OwnedCert {}
-
-impl Drop for OwnedCert {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = CertFreeCertificateContext(Some(self.context));
-        }
-    }
-}
-
 pub fn sign_pdfs_with_selection(
     pdfs: Vec<PathBuf>,
     cert_override: &CertOverride,
     verbose: bool,
     cert_selection: Option<CertSelectionRequest>,
     visible_signature: Option<VisibleSignatureRequest>,
+    _pin: Option<String>,
 ) -> Result<SignReport> {
     if pdfs.is_empty() {
         return Ok(SignReport {
@@ -177,10 +157,11 @@ pub fn sign_pdfs_with_selection(
         print!("[{}/{}] Assinando: {}... ", i + 1, pdfs.len(), nome);
         io::stdout().flush().ok();
 
+        let pin_clone = _pin.clone();
         match fs::read(input)
             .with_context(|| format!("Falha ao ler {}", input.display()))
             .and_then(|original| {
-                sign_pdf_bytes(&original, cert.context, visible_signature.as_ref())
+                sign_pdf_bytes(&original, cert, visible_signature.as_ref(), pin_clone)
                     .with_context(|| format!("Falha ao assinar {}", input.display()))
             })
             .and_then(|signed| {
@@ -208,6 +189,7 @@ pub fn sign_single_pdf_bytes(
     verbose: bool,
     visible_signature: Option<VisibleSignatureRequest>,
     cert_selection: Option<CertSelectionRequest>,
+    pin: Option<String>,
 ) -> Result<WsSignResult> {
     let certs = load_available_certificates()?;
     let cert_idx =
@@ -222,7 +204,7 @@ pub fn sign_single_pdf_bytes(
         timezone: cfg.timezone,
     });
 
-    let signed_pdf = sign_pdf_bytes(input, cert.context, visible_signature.as_ref())?;
+    let signed_pdf = sign_pdf_bytes(input, cert, visible_signature.as_ref(), pin)?;
 
     Ok(WsSignResult {
         signed_pdf,
@@ -261,6 +243,7 @@ pub fn sign_batch_pdf_bytes(
     cert_override: &CertOverride,
     verbose: bool,
     cert_selection: Option<CertSelectionRequest>,
+    pin: Option<String>,
 ) -> Result<BatchSignResult> {
     let certs = load_available_certificates()?;
     let cert_idx =
@@ -282,7 +265,8 @@ pub fn sign_batch_pdf_bytes(
                     timezone: cfg.timezone,
                 });
 
-        match sign_pdf_bytes(&input.pdf_bytes, cert.context, visible_signature.as_ref()) {
+        let pin_clone = pin.clone();
+        match sign_pdf_bytes(&input.pdf_bytes, cert, visible_signature.as_ref(), pin_clone) {
             Ok(signed_pdf) => {
                 file_results.push(BatchFileResult {
                     filename: input.filename.clone(),
@@ -314,8 +298,9 @@ pub fn sign_batch_pdf_bytes(
 
 pub fn sign_pdf_bytes(
     input: &[u8],
-    cert_ctx: *const CERT_CONTEXT,
+    cert: &OwnedCert,
     visible_signature: Option<&VisibleSignatureAppearance>,
+    pin: Option<String>,
 ) -> Result<Vec<u8>> {
     const SIG_BYTES: usize = 12_288;
     const HEX_LEN: usize = SIG_BYTES * 2;
@@ -508,7 +493,16 @@ pub fn sign_pdf_bytes(
     pdf[br_pos..br_pos + BR_PLACEHOLDER.len()].copy_from_slice(br_new.as_bytes());
 
     let signed_bytes: Vec<u8> = [&pdf[..b1], &pdf[b2..]].concat();
-    let cms_der = unsafe { cms_sign_detached(cert_ctx, &signed_bytes)? };
+    let cms_der = {
+        #[cfg(windows)]
+        {
+            unsafe { windows::cms_sign_detached(cert.context, &signed_bytes)? }
+        }
+        #[cfg(not(windows))]
+        {
+            linux::cms_sign_detached(cert, &signed_bytes, pin)?
+        }
+    };
 
     if cms_der.len() > SIG_BYTES {
         bail!(
@@ -1011,8 +1005,19 @@ pub fn normalize_thumbprint(raw: &str) -> String {
 }
 
 pub fn list_available_certificates() -> Result<Vec<CertificateSummary>> {
-    let certs = list_my_certificates()
-        .context("Falha ao acessar o repositorio de certificados do Windows")?;
+    let certs =
+        {
+            #[cfg(windows)]
+            {
+                windows::list_my_certificates()
+                    .context("Falha ao acessar o repositorio de certificados do Windows")?
+            }
+            #[cfg(not(windows))]
+            {
+                linux::list_my_certificates()
+                    .context("Falha ao acessar os certificados no Linux")?
+            }
+        };
 
     Ok(certs
         .iter()
@@ -1041,12 +1046,23 @@ fn certificate_summary_from_owned(cert: &OwnedCert, idx: usize) -> CertificateSu
 }
 
 fn load_available_certificates() -> Result<Vec<OwnedCert>> {
-    let certs = list_my_certificates()
-        .context("Falha ao acessar o repositorio de certificados do Windows")?;
+    let certs =
+        {
+            #[cfg(windows)]
+            {
+                windows::list_my_certificates()
+                    .context("Falha ao acessar o repositorio de certificados do Windows")?
+            }
+            #[cfg(not(windows))]
+            {
+                linux::list_my_certificates()
+                    .context("Falha ao acessar os certificados no Linux")?
+            }
+        };
 
     if certs.is_empty() {
         bail!(
-            "Nenhum certificado com chave privada encontrado no repositorio 'Minhas'.\n\
+            "Nenhum certificado com chave privada encontrado.\n\
              Verifique se o driver do token A3 esta instalado e o dispositivo conectado."
         );
     }
@@ -1076,7 +1092,7 @@ fn choose_certificate_index(
                 return Ok(idx);
             }
             bail!(
-                "cert_thumbprint '{}' nao encontrado no repositorio 'Minhas'.",
+                "cert_thumbprint '{}' nao encontrado.",
                 wanted
             );
         }
@@ -1171,8 +1187,7 @@ fn choose_certificate_index(
         "token_only" => {
             if hardware_candidates.is_empty() {
                 bail!(
-                    "cert_override.mode=token_only exige certificado de token/smart card, \
-                     mas nenhum foi encontrado no repositorio 'Minhas'."
+                    "cert_override.mode=token_only exige certificado de token/smart card."
                 );
             }
             candidate_indexes = hardware_candidates;
@@ -1346,7 +1361,7 @@ fn certificate_score(cert: &OwnedCert) -> (i32, Vec<String>) {
     }
     if contains_any(&subject_lc, &["token", "a3", "assinatura", "cpf", "cnpj"]) {
         score += 40;
-        reasons.push("+40 subject com indicio de certificado de assinatura".to_string());
+        reasons.push("+40 subject with indicio de certificado de assinatura".to_string());
     }
     if !looks_like_guid(&cert.subject) && !subject_lc.contains("localhost") {
         score += 30;
@@ -1355,7 +1370,7 @@ fn certificate_score(cert: &OwnedCert) -> (i32, Vec<String>) {
     (score, reasons)
 }
 
-fn contains_any(s: &str, needles: &[&str]) -> bool {
+pub fn contains_any(s: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| s.contains(needle))
 }
 
@@ -1449,276 +1464,6 @@ fn show_summary(pdfs: &[PathBuf], report: &SignReport) {
         .show();
 }
 
-fn list_my_certificates() -> Result<Vec<OwnedCert>> {
-    unsafe {
-        let store = CertOpenSystemStoreW(HCRYPTPROV_LEGACY(0), w!("MY"))
-            .context("CertOpenSystemStoreW(\"MY\") falhou")?;
-
-        let mut results = Vec::new();
-        let mut prev: Option<*const CERT_CONTEXT> = None;
-
-        loop {
-            let ctx = CertEnumCertificatesInStore(store, prev);
-            if ctx.is_null() {
-                break;
-            }
-            prev = Some(ctx as *const CERT_CONTEXT);
-
-            if !cert_has_private_key(ctx) {
-                continue;
-            }
-
-            let subject = cert_name_str(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0);
-            let issuer = cert_name_str(ctx, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG);
-            let thumbprint = cert_thumbprint_sha1(ctx)?;
-            let valid_now = cert_is_valid_now(ctx);
-            let supports_digital_signature = cert_supports_digital_signature(ctx);
-            let key_info = cert_key_provider_info(ctx).unwrap_or_default();
-            let is_hardware_token =
-                looks_like_hardware_token(&key_info.provider_name, &key_info.container_name);
-
-            let owned_ctx = CertDuplicateCertificateContext(Some(ctx as *const CERT_CONTEXT));
-            if owned_ctx.is_null() {
-                continue;
-            }
-
-            results.push(OwnedCert {
-                subject,
-                issuer,
-                thumbprint,
-                context: owned_ctx,
-                valid_now,
-                supports_digital_signature,
-                key_provider_name: key_info.provider_name,
-                key_container_name: key_info.container_name,
-                key_provider_type: key_info.provider_type,
-                key_spec: key_info.key_spec,
-                is_hardware_token,
-            });
-        }
-
-        let _ = CertCloseStore(store, 0);
-        Ok(results)
-    }
-}
-
-fn cert_has_private_key(ctx: *const CERT_CONTEXT) -> bool {
-    unsafe {
-        let mut size = 0u32;
-        CertGetCertificateContextProperty(ctx, CERT_KEY_PROV_INFO_PROP_ID, None, &mut size).is_ok()
-    }
-}
-
-#[derive(Default)]
-struct CertKeyProviderInfo {
-    provider_name: String,
-    container_name: String,
-    provider_type: u32,
-    key_spec: u32,
-}
-
-fn cert_key_provider_info(ctx: *const CERT_CONTEXT) -> Result<CertKeyProviderInfo> {
-    unsafe {
-        let mut size = 0u32;
-        CertGetCertificateContextProperty(ctx, CERT_KEY_PROV_INFO_PROP_ID, None, &mut size)
-            .context("Falha ao consultar tamanho de CERT_KEY_PROV_INFO")?;
-
-        if size == 0 {
-            return Ok(CertKeyProviderInfo::default());
-        }
-
-        let mut buffer = vec![0u8; size as usize];
-        CertGetCertificateContextProperty(
-            ctx,
-            CERT_KEY_PROV_INFO_PROP_ID,
-            Some(buffer.as_mut_ptr() as *mut _),
-            &mut size,
-        )
-        .context("Falha ao ler CERT_KEY_PROV_INFO")?;
-
-        let info = &*(buffer.as_ptr() as *const CRYPT_KEY_PROV_INFO);
-        let provider_name = wide_ptr_to_string(info.pwszProvName.0);
-        let container_name = wide_ptr_to_string(info.pwszContainerName.0);
-
-        Ok(CertKeyProviderInfo {
-            provider_name,
-            container_name,
-            provider_type: info.dwProvType,
-            key_spec: info.dwKeySpec,
-        })
-    }
-}
-
-fn cert_is_valid_now(ctx: *const CERT_CONTEXT) -> bool {
-    unsafe { CertVerifyTimeValidity(None, (*ctx).pCertInfo) == 0 }
-}
-
-fn cert_supports_digital_signature(ctx: *const CERT_CONTEXT) -> bool {
-    const ENCODING: u32 = X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0;
-    unsafe {
-        let mut key_usage = [0u8; 2];
-        if CertGetIntendedKeyUsage(
-            CERT_QUERY_ENCODING_TYPE(ENCODING),
-            (*ctx).pCertInfo,
-            &mut key_usage,
-        )
-        .is_ok()
-        {
-            (key_usage[0] & CERT_DIGITAL_SIGNATURE_KEY_USAGE as u8) != 0
-        } else {
-            true
-        }
-    }
-}
-
-fn cert_thumbprint_sha1(ctx: *const CERT_CONTEXT) -> Result<String> {
-    unsafe {
-        let mut size = 0u32;
-        CertGetCertificateContextProperty(ctx, CERT_SHA1_HASH_PROP_ID, None, &mut size)
-            .context("Falha ao consultar tamanho do thumbprint")?;
-        let mut buffer = vec![0u8; size as usize];
-        CertGetCertificateContextProperty(
-            ctx,
-            CERT_SHA1_HASH_PROP_ID,
-            Some(buffer.as_mut_ptr() as *mut _),
-            &mut size,
-        )
-        .context("Falha ao ler thumbprint")?;
-        buffer.truncate(size as usize);
-        Ok(buffer.iter().map(|b| format!("{b:02X}")).collect())
-    }
-}
-
-fn looks_like_hardware_token(provider_name: &str, container_name: &str) -> bool {
-    let provider_lc = provider_name.to_ascii_lowercase();
-    let container_lc = container_name.to_ascii_lowercase();
-    let combined = format!("{provider_lc} {container_lc}");
-
-    if contains_any(
-        &combined,
-        &[
-            "smart card",
-            "smartcard",
-            "token",
-            "etoken",
-            "safenet",
-            "watchdata",
-            "aladdin",
-            "gemalto",
-            "entersafe",
-            "epass",
-            "pkcs11",
-            "pkcs#11",
-            "a3",
-        ],
-    ) {
-        return true;
-    }
-
-    false
-}
-
-unsafe fn wide_ptr_to_string(ptr: *mut u16) -> String {
-    unsafe {
-        if ptr.is_null() {
-            return String::new();
-        }
-
-        let mut len = 0usize;
-        while *ptr.add(len) != 0 {
-            len += 1;
-        }
-
-        if len == 0 {
-            return String::new();
-        }
-
-        let slice = slice::from_raw_parts(ptr, len);
-        String::from_utf16_lossy(slice)
-    }
-}
-
-unsafe fn cert_name_str(ctx: *const CERT_CONTEXT, name_type: u32, flags: u32) -> String {
-    unsafe {
-        let len = CertGetNameStringW(ctx, name_type, flags, None, None);
-        if len <= 1 {
-            return String::new();
-        }
-
-        let mut buf = vec![0u16; len as usize];
-        let _ = CertGetNameStringW(ctx, name_type, flags, None, Some(&mut buf));
-
-        String::from_utf16_lossy(&buf[..buf.len().saturating_sub(1)])
-    }
-}
-
-static SHA256_OID: &[u8] = b"2.16.840.1.101.3.4.2.1\0";
-
-unsafe fn cms_sign_detached(cert_ctx: *const CERT_CONTEXT, signed_bytes: &[u8]) -> Result<Vec<u8>> {
-    unsafe {
-        const ENCODING: u32 = X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0;
-
-        let hash_alg = CRYPT_ALGORITHM_IDENTIFIER {
-            pszObjId: PSTR(SHA256_OID.as_ptr() as *mut u8),
-            Parameters: CRYPT_INTEGER_BLOB {
-                cbData: 0,
-                pbData: std::ptr::null_mut(),
-            },
-        };
-
-        let sign_para = CRYPT_SIGN_MESSAGE_PARA {
-            cbSize: mem::size_of::<CRYPT_SIGN_MESSAGE_PARA>() as u32,
-            dwMsgEncodingType: ENCODING,
-            pSigningCert: cert_ctx,
-            HashAlgorithm: hash_alg,
-            pvHashAuxInfo: std::ptr::null_mut(),
-            cMsgCert: 0,
-            rgpMsgCert: std::ptr::null_mut(),
-            cMsgCrl: 0,
-            rgpMsgCrl: std::ptr::null_mut(),
-            cAuthAttr: 0,
-            rgAuthAttr: std::ptr::null_mut(),
-            cUnauthAttr: 0,
-            rgUnauthAttr: std::ptr::null_mut(),
-            dwFlags: 0,
-            dwInnerContentType: 0,
-        };
-
-        let data_ptr: *const u8 = signed_bytes.as_ptr();
-        let data_ptrs = [data_ptr];
-        let data_size: u32 = signed_bytes.len() as u32;
-
-        let mut sig_len: u32 = 0;
-        CryptSignMessage(
-            &sign_para,
-            BOOL(1),
-            1,
-            Some(data_ptrs.as_ptr()),
-            &data_size,
-            None,
-            &mut sig_len,
-        )
-        .context(
-            "CryptSignMessage (calcular tamanho) falhou - verifique PIN e conectividade do token",
-        )?;
-
-        let mut sig = vec![0u8; sig_len as usize];
-        CryptSignMessage(
-            &sign_para,
-            BOOL(1),
-            1,
-            Some(data_ptrs.as_ptr()),
-            &data_size,
-            Some(sig.as_mut_ptr()),
-            &mut sig_len,
-        )
-        .context("CryptSignMessage (assinar) falhou")?;
-
-        sig.truncate(sig_len as usize);
-        Ok(sig)
-    }
-}
-
 fn file_name(p: &Path) -> String {
     p.file_name()
         .unwrap_or_default()
@@ -1761,7 +1506,6 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::config::CertOverride;
-    use windows::Win32::Security::Cryptography::CERT_CONTEXT;
 
     fn fake_cert(
         subject: &str,
@@ -1776,7 +1520,8 @@ mod tests {
             subject: subject.to_string(),
             issuer: issuer.to_string(),
             thumbprint: normalize_thumbprint(thumbprint),
-            context: std::ptr::null::<CERT_CONTEXT>(),
+            #[cfg(windows)]
+            context: std::ptr::null::<windows::CERT_CONTEXT>(),
             valid_now,
             supports_digital_signature,
             key_provider_name: provider_name.to_string(),
@@ -1784,6 +1529,12 @@ mod tests {
             key_provider_type: 0,
             key_spec: 0,
             is_hardware_token,
+            #[cfg(not(windows))]
+            slot_id: 0,
+            #[cfg(not(windows))]
+            cert_id: Vec::new(),
+            #[cfg(not(windows))]
+            pkcs11_lib: std::path::PathBuf::new(),
         }
     }
 
@@ -1988,6 +1739,5 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("token_only"));
-        assert!(err.contains("hardware token"));
     }
 }
